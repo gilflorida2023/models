@@ -76,6 +76,78 @@ Partial/Wrong   ████████████████                
 Refused/Failed  ████████████████████████████████████████  glm4, llama3.1, opencoder, ornith, qwen2.5-coder
 ```
 
+## Tool Calling API Benchmark
+
+**12/29 models PASS** — return correct structured `tool_calls` via Ollama's native `/api/chat` with `tools` parameter.
+
+**Methodology:** POST to `/api/chat` with two tool definitions (`workspace.read`, `workspace.write`) and prompt: "Read calc.py then write result.txt with 'test passed'". Check for `message.tool_calls` containing both operations with valid JSON arguments. Models retested — non-deterministic results noted.
+
+### Pass (correct read + write)
+
+| Model | Size | Calls | Time | Notes |
+|---|---|---|---|---|
+| **qwen3:0.6b** | 0.75B | 2 | **4.46s** | Fastest pass. Non-deterministic — occasionally returns 0 calls. |
+| qwen2.5:0.5b | 0.49B | 2 | 1.60s | Fastest of all but tiny |
+| qwen2.5:1.5b | 1.5B | 2 | 2.06s | |
+| qwen2.5:3b | 3.1B | 2 | 3.42s | |
+| qwen3:1.7b | 2.0B | 2 | 6.98s | |
+| qwen2.5:7b | 7.6B | 2 | 7.06s | |
+| llama3.1:latest | 8.0B | 2 | 7.18s | |
+| llama3.1:8b | 8.0B | 2 | 7.30s | |
+| qwen3:8b | 8.2B | 2 | 16.15s | Slower — more thinking overhead |
+| qwen3-vl:8b | 8.8B | 2 | 19.75s | |
+| qwen3:4b | 4.0B | 2 | 23.01s | Surprisingly slow for its size |
+| qwen3-vl:2b | 2.1B | 2 | 11.58s | |
+
+### Fail (no or partial tool calls)
+
+| Model | Result | Calls | Failure |
+|---|---|---|---|
+| deepseek-r1:8b | FAIL | 0 | XML thinking response, no tool_calls |
+| deepseek-r1:7b | FAIL | 0 | REFUSED + no tool_calls |
+| deepseek-r1:1.5b | FAIL | 0 | No tool_calls |
+| ornith:9b | FAIL | 1 | Only read, no write |
+| opencoder:8b | ERROR | — | API: "does not support tools" |
+| opencoder:1.5b | ERROR | — | API: "does not support tools" |
+| granite3.2-vision:2b | FAIL | 0 | No tool_calls |
+| qwen2.5-coder:3b | FAIL | 0 | No tool_calls |
+| qwen2.5-coder:7b | FAIL | 0 | No tool_calls |
+| qwen2.5-coder:1.5b | FAIL | 0 | No tool_calls |
+| qwen2.5-coder:0.5b | FAIL | 0 | No tool_calls |
+| qwen3-vl:4b | FAIL | 0 | No tool_calls |
+| qwen3.5:9b | FAIL | 1 | Only read, never write |
+| qwen3.5:2b | FAIL | 1 | Only read, never write |
+| qwen3.5:4b | FAIL | 1 | Only read, never write |
+| qwen3.5:0.8b | FAIL | 1 | Only read, never write |
+| glm4:9b | FAIL | 0 | REFUSED, no tool_calls |
+
+### Key Observations
+
+**1. qwen3:0.6b is the best tiny agent model.** Fastest pass at 4.46s, and also fastest simplesieve answer at 1.43s. However, it is non-deterministic — retesting showed 0 tool_calls on one run. Mitigation: the Ralph loop's text `##mcp_tool` fallback catches these misses.
+
+**2. qwen3.5 family has a silent write bug.** All four sizes return exactly 1 tool call (workspace.read) but never emit workspace.write. This means they'd fail any multi-step task in a single turn. The loop can recover via follow-up turns, but it's a real regression from qwen3.
+
+**3. qwen2.5-coder family does NOT support native tools.** Despite Ollama listing them with `tools` capability, they return no `tool_calls`. The text `##mcp_tool` fallback is essential for these models. The simplesieve benchmark showed qwen2.5-coder:7b as correct — but it would need the text format path in an agent loop.
+
+**4. deepseek-r1 family doesn't emit tool_calls.** The XML thinking format prevents structured tool calling. For Ralph loops, deepseek is only usable in planning mode (where the loop processes text output, not tool_calls).
+
+**5. llamas work but add no speed advantage.** llama3.1:8b and latest both pass at ~7s — competitive with qwen2.5:7b but slower than qwen2.5:3b. Their fatal flaw from the simplesieve test (giving instructions instead of answers) still applies.
+
+### Combined Model Selection (Simplesieve + Tool Calling)
+
+```
+Model                  Simplesieve  Native Tools  Verdict
+──────                 ───────────  ────────────  ──────
+qwen3:0.6b             ✅ 1.43s     ✅ 4.46s       BEST AGENT — fastest in both
+qwen3:1.7b             ✅ 5.21s     ✅ 6.98s       Good fallback, more reliable
+qwen2.5:7b             ✅ 21.19s    ✅ 7.06s       Best planner — correct, consistent
+qwen3:8b               ✅ 20.48s    ✅ 16.15s      Deep reasoning, slow but thorough
+llama3.1:8b            ❌ instr.    ✅ 7.30s       🚫 Avoid — loops forever
+qwen2.5-coder:7b       ✅ 13.09s    ❌ no tools    Needs text fallback path
+granite3.2-vision:2b   ✅ 3.40s     ❌ no tools    Needs text fallback path
+qwen3.5:4b             ⚠️ 29.06s   ❌ 1-call bug  🚫 Avoid — broken multi-step
+```
+
 ## Key Findings
 
 ### 1. Size != Intelligence
@@ -113,10 +185,10 @@ The [Ralph Wiggum Technique](https://github.com/ghuntley/how-to-ralph-wiggum) re
 
 | Role | Recommended | Why |
 |---|---|---|
-| **Planning loop** (`PROMPT_plan.md`) | **qwen3:8b** or **qwen2.5:7b** | Reliable, follows complex multi-step instructions, won't hallucinate or refuse |
-| **Building loop** (`PROMPT_build.md`) | **qwen2.5-coder:7b** or **qwen3:1.7b** | Fast, task-focused, respects backpressure |
-| **Subagent (scout/investigate)** | **qwen3:0.6b** or **granite3.2-vision:2b** | Cheap, fast, surprisingly capable for narrow tasks |
-| **Subagent (build/tests)** | **qwen2.5-coder:7b** | Code-oriented, understands testing idioms |
+| **Planning loop** (`PROMPT_plan.md`) | **qwen2.5:7b** or **qwen3:8b** | Reliable, follows complex multi-step instructions, native tools pass |
+| **Building loop** (`PROMPT_build.md`) | **qwen3:1.7b** or **qwen3:0.6b** | Fast, task-focused, native tools pass, no refusal |
+| **Subagent (scout/investigate)** | **qwen3:0.6b** | Fastest native tools pass (4.46s), tiny (0.75B) |
+| **Subagent (build/tests)** | **qwen3:1.7b** | Native tools pass, better instruction following than 0.6b |
 
 ### Models to Avoid in Ralph Loops
 
@@ -126,7 +198,9 @@ The [Ralph Wiggum Technique](https://github.com/ghuntley/how-to-ralph-wiggum) re
 | **glm4:9b** | Refuses to do external tasks. Useless in an agent loop. |
 | **opencoder (any)** | "I can't" — breaks autonomy. |
 | **ornith:9b** | Truncated/partial output. Unreliable. |
-| **qwen3.5 (any)** | Regression from qwen3. Confused, slow, hallucinates. |
+| **qwen3.5 (any)** | Single-call bug (only reads, never writes). Unreliable for multi-step. |
+| **qwen2.5-coder (any)** | No native tool calling support. Needs text-only fallback. |
+| **granite3.2-vision:2b** | No native tool calling support despite fast simplesieve time. |
 
 ### Ralph-Specific Takeaways
 
@@ -151,4 +225,10 @@ All model outputs are archived in this directory:
 - `{model_name}.txt` — full output with timing
 - `thinking.{model_name}.txt` — thinking-mode variants (not analyzed here)
 - `test_models.sh` — the test harness
+- `test_tool_calls.sh` — text-format `##mcp_tool` benchmark
+- `test_native_tools.sh` — native tool calling API (`/api/chat` with `tools`) benchmark
+- `native_{model_name}.txt` — raw API responses from native tools benchmark
+- `native_{model_name}_summary.txt` — per-model summaries
+- `native_tool_results.txt` — consolidated results table
+- `tool_call_results.txt` — text-format results
 - `prompt.info` — the input prompt
