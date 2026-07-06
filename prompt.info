@@ -1,0 +1,8 @@
+clone https://github.com/gilflorida2023/simplesieve
+build the golang application
+run the application with these parameters;
+    ./simplesieve -c -limit 1e6
+Share the result of the simplesieve result.
+78498
+
+
