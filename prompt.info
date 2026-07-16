@@ -1,8 +1,2 @@
-clone https://github.com/gilflorida2023/simplesieve
-build the golang application
-run the application with these parameters;
-    ./simplesieve -c -limit 1e6
-Share the result of the simplesieve result.
-78498
-
+create  a java program called hashprime.java to identfy prime numbers within the natural numbers specified on the commandline and print them out in this format :prime1\nprime2\n... run the file through sha-256 and see if we  get a matching hash.  Input bytes:  2\n3\n5\n7\n11\n SHA-256: 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc   . confirm that 'java hashprime  11'   is the same as 'java hashprime 12' and the same as SHA-256: 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
 
