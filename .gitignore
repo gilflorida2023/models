@@ -1,2 +1,7 @@
-
-*.txt
+__pycache__/
+benchmark_run.log
+qdrant_data/
+corpora/
+results/
+*.class
+*.jar
