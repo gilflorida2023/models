@@ -18,6 +18,30 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 PER_MODEL_TIMEOUT = 600
 MAX_TURNS = 10
 EXPECTED_HASH = "563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc"
+
+# Large-N validation: confirm the sieve actually scales (and isn't a hardcoded
+# small-N trick) by checking the prime list for N=1,000,000 against the
+# authoritative OEIS A000040 manifest (ascii_integer_lf formatting).
+LARGE_N = 1_000_000
+MANIFEST_PATH = "/home/scout/projects/math-kat/manifests/A000040.json"
+LARGE_N_EXPECTED_HASH = "4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28"
+LARGE_N_EXPECTED_COUNT = 78498
+
+
+def load_manifest_hash():
+    """Load the authoritative 1e6 hash (and prime count) from the A000040 manifest.
+    Falls back to the hardcoded constants if the manifest is missing/unreadable."""
+    try:
+        with open(MANIFEST_PATH) as f:
+            data = json.load(f)
+        chk = data.get("checkpoint_hashes", {}).get(str(LARGE_N), {})
+        return chk.get("hash", LARGE_N_EXPECTED_HASH), chk.get("count", LARGE_N_EXPECTED_COUNT)
+    except Exception:
+        return LARGE_N_EXPECTED_HASH, LARGE_N_EXPECTED_COUNT
+
+
+LARGE_N_EXPECTED_HASH, LARGE_N_EXPECTED_COUNT = load_manifest_hash()
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(BASE_DIR, "tools")
 CHECKSTYLE_JAR = os.path.join(TOOLS_DIR, "checkstyle.jar")
@@ -806,6 +830,8 @@ def try_compile_and_verify(run_dir):
     result = {
         "compile_ok": False, "hash_match": False, "javac_warnings": 0,
         "checkstyle_count": 0, "pmd_count": 0, "lint_time": 0, "exec_time": 0, "output": "",
+        "large_n_match": False, "large_n_count_match": False,
+        "large_n_exec_time": 0, "large_n_hash": "",
     }
     if not os.path.exists(java_file):
         return result
@@ -879,6 +905,32 @@ def try_compile_and_verify(run_dir):
         except:
             pass
 
+    # Large-N validation (N=1e6): proves the sieve scales and isn't a
+    # hardcoded small-N trick. Compares to the authoritative A000040 manifest.
+    try:
+        start = time.time()
+        r = subprocess.run(
+            ["java", "-cp", run_dir, "hashprime", str(LARGE_N)],
+            capture_output=True, text=True, timeout=120, cwd=run_dir
+        )
+        result["large_n_exec_time"] = time.time() - start
+        if r.returncode == 0:
+            out = r.stdout
+            result["large_n_hash"] = hashlib.sha256(out.encode()).hexdigest()
+            result["large_n_match"] = (result["large_n_hash"] == LARGE_N_EXPECTED_HASH)
+            # Count primes (lines that parse as integers), compare to manifest count
+            try:
+                cnt = sum(1 for line in out.split("\n") if line.strip())
+                result["large_n_count"] = cnt
+                result["large_n_count_match"] = (cnt == LARGE_N_EXPECTED_COUNT)
+            except Exception:
+                pass
+            print(f"  ── large-N (1e6) ── hash_match={result['large_n_match']} "
+                  f"count_match={result['large_n_count_match']} "
+                  f"({result['large_n_exec_time']:.2f}s)")
+    except Exception as e:
+        print(f"  ── large-N (1e6) FAILED: {e}")
+
     return result
 
 
@@ -943,6 +995,10 @@ def score_run(run_dir, conversation, timing, mode):
     score["details"]["compile_ok"] = compile_ok
     score["details"]["hash_match"] = hash_match
     score["details"]["has_java_source"] = has_java
+    score["details"]["large_n_match"] = timing.get("large_n_match", False)
+    score["details"]["large_n_count_match"] = timing.get("large_n_count_match", False)
+    score["details"]["large_n_exec_time"] = timing.get("large_n_exec_time", 0)
+    score["details"]["large_n_hash"] = timing.get("large_n_hash", "")
 
     # Speed (exclude lint time from model's speed score)
     total_time = timing.get("total_seconds", 999)
@@ -1100,6 +1156,7 @@ Result:   {'✓ PASS' if score['correctness'] >= 100 else '✗ FAIL'}
 Time:     {human_model} model + {human_lint} lint = {human_total} wall  (score: {score['speed_score']}/100)
 Correct:  {'Yes - hash matches expected' if score['correctness'] >= 100 else 'No - wrong hash'}
 Compiled: {'Yes' if score['details'].get('compile_ok') else 'No'}
+Large-N:  {'Yes - 1e6 hash matches A000040 manifest' if score['details'].get('large_n_match') else 'No - 1e6 mismatch/failed'} ({score['details'].get('large_n_exec_time', 0):.2f}s)
 Quality:  {lint_str}  (score: {score['code_quality']}/100 — higher=cleaner)
 Tokens:   {prompt_tokens} sent + {completion_tokens} generated = {prompt_tokens + completion_tokens} total  (gen {gen_tok_s:.1f} tok/s, prompt {prompt_tok_s:.1f} tok/s){token_block}
 Tools:    [{tools_used}]  (score: {score['tool_usage']}/100 — higher=more tools used)
@@ -1516,6 +1573,8 @@ def main():
         think_tag = "✓" if thinking_support else "✗"
         used_retrieval = score["details"].get("used_retrieval", False)
         retr_tag = "✓" if used_retrieval else "✗"
+        large_n_match = score["details"].get("large_n_match", False)
+        large_n_tag = "✓" if large_n_match else "✗"
         total_violations = (
             score["details"].get("javac_warnings", 0) +
             score["details"].get("checkstyle_count", 0) +
@@ -1560,6 +1619,7 @@ def main():
             "prompt_ts": score["details"].get("prompt_ts", 0.0),
             "thinking_drift": score["details"].get("thinking_drift"),
             "retr_tag": retr_tag,
+            "large_n_tag": large_n_tag,
             "used_retrieval": used_retrieval,
             "jq_passed": jq_passed,
             "has_write_file": has_write_file,
@@ -1588,6 +1648,7 @@ def main():
         ("exec",    "EXEC",  9,   "EXEC"),
         ("time",    "MTIME", 10,  "MTIME"),
         ("tok_s",   "TOK/s", 7,   "TOK/s"),
+        ("large",   "1E6",   5,   "1E6"),
         ("mode",    "MODE",  8,   "MODE"),
     ]
 
@@ -1614,6 +1675,7 @@ def main():
             "exec": r["exec_str"],
             "time": r["time_str"],
             "tok_s": f"{r['gen_tok_s']:.1f}",
+            "large": r["large_n_tag"],
             "mode": r["mode"],
         }
 
@@ -1659,6 +1721,7 @@ def main():
         "- **EXEC**: time for compiled Java code to execute (seconds)",
         "- **MTIME**: total model wall-clock time excluding lint (seconds or minutes)",
         "- **TOK/s**: generation throughput — completion tokens per second of model wall-clock time (higher = faster generation)",
+        "- **1E6**: does the sieve scale? Hash of the prime list for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). ✓ = scales correctly, ✗ = mismatch/failed. This also neutralizes any 'don't write a file' micro-optimization advantage, since at 1e6 the algorithm dominates runtime.",
         "- **MODE**: `tool_call` = native Ollama tool API, `text` = JSON extracted from plaintext",
         "",
     ])
