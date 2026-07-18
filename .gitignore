@@ -1,6 +1,7 @@
 __pycache__/
 benchmark_run.log
 qdrant_data/
+qdrant_data.bak/
 corpora/
 results/
 *.class

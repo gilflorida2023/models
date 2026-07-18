@@ -522,11 +522,14 @@ def tool_search_solutions(args, run_dir):
         return json.dumps({"ok": False, "error": f"qdrant unavailable: {e}"})
 
     results = []
+    collections_checked = 0
     for coll in SEARCH_COLLECTIONS:
         try:
             qdrant.get_collection(coll)
         except Exception:
+            # Collection doesn't exist in this store — skip, but record it.
             continue
+        collections_checked += 1
         try:
             pts = qdrant.query_points(
                 collection_name=coll, query=vec.tolist(), limit=SEARCH_TOP_K
@@ -539,12 +542,24 @@ def tool_search_solutions(args, run_dir):
                 "collection": coll,
                 "source": payload.get("source", "?"),
                 "score": round(p.score, 4),
+                "verified": bool(payload.get("verified", False)),
                 "text": (payload.get("text", "") or "")[:800],
             })
     if not results:
+        # Distinguish "store is empty/unavailable" from "no relevant match" so
+        # the model isn't misled into thinking retrieval is unsupported.
+        note = ("No reference chunks found for this query."
+                if collections_checked
+                else "Reference corpus unavailable/empty (no collections loaded).")
         return json.dumps({"ok": True, "query": query[:200], "results": [],
-                            "note": "No reference chunks found."})
-    return json.dumps({"ok": True, "query": query[:200], "results": results})
+                            "collections_checked": collections_checked,
+                            "note": note})
+    # Surface verified (certified-correct) solutions first so a model that
+    # chooses to consult prior art sees known-good code ahead of unverified.
+    results.sort(key=lambda r: (not r.get("verified", False), -r["score"]))
+    return json.dumps({"ok": True, "query": query[:200],
+                        "verified_count": sum(1 for r in results if r.get("verified")),
+                        "results": results})
 
 
 TOOL_DISPATCH = {
@@ -1792,6 +1807,30 @@ def _write_ranking(results_summary):
             "mode": r["mode"],
         }
 
+    # Compact per-column legend shown right under the table (console + markdown).
+    COL_LEGEND = {
+        "rank":   "rank / position",
+        "model":  "model name",
+        "score":  "composite score (0-100)",
+        "correct":"correctness (0=none, 25=has Java, 50=compiles, 100=hash match)",
+        "c_tag":  "compiled? (✓/✗)",
+        "h_tag":  "SHA-256 hash matches expected? (✓/✗)",
+        "viol":   "lint violations (javac+checkstyle+PMD; lower better)",
+        "sem":    "semantic gate pass? (✓/✗)",
+        "tool":   "tool-call support? (✓/✗)",
+        "think":  "thinking/reasoning trace present? (✓/✗)",
+        "retr":   "used search_solutions retrieval? (✓/✗)",
+        "ts":     "thinking quality (0-100, vs hashprime_solutions)",
+        "drift":  "TSCORE − prompt baseline (positive=more on-topic)",
+        "iter":   "conversation turns used",
+        "exec":   "compiled Java execution time",
+        "time":   "model wall-clock time (excl. lint)",
+        "tok_s":  "generation throughput (tokens/sec)",
+        "large":  "1E6 sieve hash == manifest? (✓/✗/E)",
+        "large2": "1E7 sieve hash == manifest? (✓/✗/E)",
+        "mode":   "tool_call = native API, text = JSON-in-plaintext",
+    }
+
     # ── Console ranking table ──
     print(f"\n{'='*150}")
     console_header = "  " + "  ".join(f"{h:<{w}}" for _, h, w, _ in COLS)
@@ -1802,6 +1841,11 @@ def _write_ranking(results_summary):
     for i, r in enumerate(results_summary, 1):
         v = row_values(i, r)
         print("  " + "  ".join(f"{str(v[k]):<{w}}" for k, _, w, _ in COLS))
+
+    # Column legend directly under the console table.
+    print(f"\n  Column legend:")
+    for key, _, _, h in COLS:
+        print(f"    {h:<7} = {COL_LEGEND.get(key, '')}")
 
     # ── Markdown ranking table ──
     md_lines = [
@@ -1815,6 +1859,13 @@ def _write_ranking(results_summary):
     for i, r in enumerate(results_summary, 1):
         v = row_values(i, r)
         md_lines.append("| " + " | ".join(str(v[k]) for k, _, _, _ in COLS) + " |")
+
+    md_lines.extend([
+        "",
+        "### Column legend",
+    ])
+    for key, _, _, h in COLS:
+        md_lines.append(f"- **{h}**: {COL_LEGEND.get(key, '')}")
 
     md_lines.extend([
         "",
