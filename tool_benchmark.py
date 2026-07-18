@@ -9,14 +9,28 @@ Handles both native tool-calling models and text-only models (extracts code).
 
 import json, os, sys, time, subprocess, hashlib, re, shutil
 from datetime import datetime
-import requests, numpy as np
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+
+# Heavy/optional deps are imported lazily so the module still loads (e.g. for
+# standalone Java verification) on a machine without numpy / qdrant / chonkie.
+try:
+    import requests  # noqa: F401
+except ImportError:
+    requests = None
+try:
+    import numpy as np
+except ImportError:
+    np = None
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http.models import Distance, VectorParams
+except ImportError:
+    QdrantClient = None
+    Distance = VectorParams = None
 
 RESULTS_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 OLLAMA_URL = "http://localhost:11434/api/chat"
 PER_MODEL_TIMEOUT = 600
-MAX_TURNS = 10
+MAX_TURNS = 20
 EXPECTED_HASH = "563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc"
 
 # Large-N validation: confirm the sieve actually scales (and isn't a hardcoded
@@ -136,37 +150,15 @@ Tool: search_solutions
   Example: {"name": "search_solutions", "arguments": {"query": "Sieve of Eratosthenes feed primes to SHA-256"}}
 """
 
-PROMPT = """You are solving a Java programming challenge. You have access to tools to write files, compile, run commands, and verify results.
-""" + TOOL_DESCRIPTIONS + """
-Create the fastest possible single-file Java program named hashprime.java that takes one integer N from the command line. Generate all prime numbers from 2 to N using a Sieve of Eratosthenes. Write each prime to a temp file named tempoutput.txt followed by a single newline byte ('\\n'). Compute the SHA-256 digest over those exact tempoutput.txt bytes and print ONLY that hash to stdout. The temp file is deleted after hashing, so it must not be left behind. The digest over the prime bytes for N=11 is exactly 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc, and N=12 is identical (12 is not prime), so both must produce that same hash.
+def _load_prompt_body():
+    """Load the task-specific prompt body from prompt.hashprime.txt so the
+    prompt can be edited on disk without touching this script."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.hashprime.txt")
+    with open(path) as f:
+        return f.read()
 
-VALIDATION CONTRACT (the SHA-256 is computed over the tempoutput.txt prime bytes; stdout shows ONLY the hash):
-  Command:              java hashprime 11
-  Prime bytes (in tempoutput.txt):      2\\n3\\n5\\n7\\n11\\n
-  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
 
-  Command:              java hashprime 12
-  Prime bytes (in tempoutput.txt):      2\\n3\\n5\\n7\\n11\\n   (12 is not prime, so identical to N=11)
-  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
-
-  Command:              java hashprime 1000000
-  Expected SHA-256 (stdout):     4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
-  Command:              java hashprime 10000000
-  Expected prime count: 664579
-  Expected SHA-256 (stdout):     36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
-
-Use public class hashprime (lowercase) to match the filename.
-Respond with a JSON tool call to use a tool, or plain text to communicate.
-
-Your program must produce the matching bytes (and therefore the matching digest) at ALL four scales — do not hardcode or special-case small N. The same algorithm must be correct from N=11 through N=10000000.
-
-HELPFUL TOOLS (use them to verify as you go):
-
-  - write_file        : save your code to hashprime.java
-  - compile_java      : compile it with javac
-  - run_and_hash      : run java hashprime N and return its SHA-256 — check it equals the expected digest above
-  - submit_answer     : submit your final hash when confident
-  - search_solutions  : query the indexed Qdrant reference corpora (prior hashprime.java solutions, algorithm patterns, sysadmin notes) for useful code — a positive signal, never penalized; improve on what you find rather than copying it"""
+PROMPT = "You are solving a Java programming challenge. You have access to tools to write files, compile, run commands, and verify results.\n" + TOOL_DESCRIPTIONS + "\n" + _load_prompt_body()
 
 
 # === Code extraction ===
@@ -1068,6 +1060,8 @@ def score_run(run_dir, conversation, timing, mode):
         score["correctness"] = 50
     elif has_java:
         score["correctness"] = 25
+    else:
+        score["correctness"] = 0
 
     score["details"]["compile_ok"] = compile_ok
     score["details"]["hash_match"] = hash_match
@@ -1353,6 +1347,17 @@ def run_model_benchmark(model):
     did_compile_verify = False
     stall_counter = {}  # content_hash -> count, to detect repeated failures
 
+    # Defensive cleanup: a leftover tempoutput.txt from a prior manual run or
+    # an interrupted benchmark would otherwise be silently hashed by the verify
+    # steps and produce a false result. Start each run from a clean slate.
+    _stale = os.path.join(run_dir, "tempoutput.txt")
+    if os.path.exists(_stale):
+        try:
+            os.remove(_stale)
+            print(f"  Removed stale tempoutput.txt from {run_dir}")
+        except OSError:
+            pass
+
     for turn in range(1, MAX_TURNS + 1):
         elapsed = time.time() - start_time
         if elapsed > PER_MODEL_TIMEOUT:
@@ -1600,6 +1605,26 @@ def run_model_benchmark(model):
     timing["prompt_tokens"] = total_prompt_tokens
     timing["completion_tokens"] = total_completion_tokens
 
+    # Post-loop large-N recompute. The per-turn loop may hit PER_MODEL_TIMEOUT
+    # (or MAX_TURNS) before the in-loop try_compile_and_verify finishes the
+    # 1E6/1E7 sieves, leaving large_n_* empty/False even though the compiled
+    # class is correct. If the class compiled but large-N was not verified
+    # (empty hash), re-run try_compile_and_verify now (on its own budget,
+    # untimed) so a correct-but-slow model is not recorded as a false negative.
+    if (timing.get("compile_ok")
+            and os.path.exists(os.path.join(run_dir, "hashprime.java"))
+            and did_compile_verify
+            and not timing.get("large_n_match")
+            and not timing.get("large_n2_match")):
+        try:
+            print("  Re-running large-N verification (post-loop, untimed)...")
+            tcv = try_compile_and_verify(run_dir)
+            _copy_large_n(timing, tcv)
+            # Keep the better of the two hash_match observations.
+            timing["hash_match"] = timing.get("hash_match") or tcv.get("hash_match", False)
+        except Exception as e:
+            print(f"  Post-loop large-N verify failed: {e}")
+
     score = score_run(run_dir, conversation, timing, mode)
 
     # Cleanup this model after testing — NOT timed
@@ -1611,118 +1636,111 @@ def run_model_benchmark(model):
     return score, run_dir
 
 
-def main():
-    os.makedirs(RESULTS_BASE, exist_ok=True)
+def score_to_row(model, run_dir, score):
+    """Convert a finished score dict into a ranking summary row."""
+    sem_passed = score["details"].get("semantic_passed", True)
+    sem_score = score["details"].get("semantic_score", 0.0)
+    sem_tag = "✓" if sem_passed else "✗"
+    tools_used_list = score["details"].get("tools_used", [])
+    has_write_file = "write_file" in tools_used_list
+    jq_passed = score["details"].get("jq_audit_passed", True)
+    tool_ok = "✓" if (score["details"].get("mode") == "tool_call" or (has_write_file and jq_passed)) else "✗"
+    compile_ok = score["details"].get("compile_ok", False)
+    hash_match = score["details"].get("hash_match", False)
+    thinking_support = score["details"].get("thinking_support", False)
+    think_tag = "✓" if thinking_support else "✗"
+    used_retrieval = score["details"].get("used_retrieval", False)
+    retr_tag = "✓" if used_retrieval else "✗"
+    large_n_match = score["details"].get("large_n_match", False)
+    large_n_err = score["details"].get("large_n_error", "")
+    large_n_tag = "✓" if large_n_match else ("E" if large_n_err else "✗")
+    large_n2_match = score["details"].get("large_n2_match", False)
+    large_n2_err = score["details"].get("large_n2_error", "")
+    large_n2_tag = "✓" if large_n2_match else ("E" if large_n2_err else "✗")
+    total_violations = (
+        score["details"].get("javac_warnings", 0) +
+        score["details"].get("checkstyle_count", 0) +
+        score["details"].get("pmd_count", 0)
+    )
+    turns_used = score["details"].get("turns_used", 0)
+    exec_secs = score["details"].get("exec_time", 0)
+    model_time_secs = score["details"].get("model_time_seconds", 0)
+    model_name_short = model[:25] if len(model) > 25 else model
 
-    resp = requests.get("http://localhost:11434/api/tags", timeout=10)
-    resp.raise_for_status()
-    models = [m["name"] for m in resp.json().get("models", [])]
+    return {
+        "model": model,
+        "model_short": model_name_short,
+        "score": score["total"],
+        "correct": score["correctness"],
+        "compile_ok": compile_ok,
+        "hash_match": hash_match,
+        "speed": score["speed_score"],
+        "quality": score["code_quality"],
+        "tools": score["tool_usage"],
+        "violations": total_violations,
+        "turns_used": turns_used,
+        "exec_time_secs": round(exec_secs, 3),
+        "exec_str": format_time(exec_secs) if exec_secs > 0 else "-",
+        "model_time_secs": model_time_secs,
+        "time_str": format_time(model_time_secs),
+        "gen_tok_s": score["details"].get("gen_tok_s", 0.0),
+        "tools_used": ", ".join(tools_used_list),
+        "mode": score["details"].get("mode", "?"),
+        "javac_w": score["details"].get("javac_warnings", 0),
+        "cs": score["details"].get("checkstyle_count", 0),
+        "pmd": score["details"].get("pmd_count", 0),
+        "sem_tag": sem_tag,
+        "sem_score": round(sem_score, 2),
+        "tool_ok": tool_ok,
+        "think_tag": think_tag,
+        "thinking_support": thinking_support,
+        "think_score": score["details"].get("thinking_quality", 0),
+        "thinking_quality_chunks": score["details"].get("thinking_quality_chunks", 0),
+        "thinking_quality_mean_sim": score["details"].get("thinking_quality_mean_sim", 0),
+        "thinking_quality_error": score["details"].get("thinking_quality_error"),
+        "prompt_ts": score["details"].get("prompt_ts", 0.0),
+        "thinking_drift": score["details"].get("thinking_drift"),
+        "retr_tag": retr_tag,
+        "large_n_tag": large_n_tag,
+        "large_n2_tag": large_n2_tag,
+        "used_retrieval": used_retrieval,
+        "jq_passed": jq_passed,
+        "has_write_file": has_write_file,
+        "run_dir": run_dir,
+    }
 
-    if not models:
-        print("No models found.")
-        sys.exit(1)
 
-    print(f"Found {len(models)} models:")
-    for m in models:
-        print(f"  - {m}")
-
-    # Filter out non-chat models (e.g. embedding-only) up front; report them.
-    chat_models = []
-    skipped_models = []
-    for m in models:
-        caps = get_model_capabilities(m)
-        if "completion" in caps:
-            chat_models.append(m)
-        else:
-            skipped_models.append((m, sorted(caps) or "none"))
-    if skipped_models:
-        print(f"\nSkipping {len(skipped_models)} non-chat model(s):")
-        for m, caps in skipped_models:
-            print(f"  - {m} (capabilities: {caps})")
+def regenerate_ranking():
+    """Rebuild ranking.md / ranking.json from all existing results/*/*/score.json
+    on disk. Lets a re-verification pass (which patches score.json in place)
+    refresh the tables without re-running the whole benchmark."""
+    import glob as _glob
 
     results_summary = []
-
-    for model in chat_models:
-        result, run_dir = run_model_benchmark(model)
-        if isinstance(result, dict) and result.get("skipped"):
-            print(f"  (skipped {model}: {result.get('reason')})")
+    for sp in _glob.glob(os.path.join(RESULTS_BASE, "*", "*", "score.json")):
+        try:
+            with open(sp) as f:
+                score = json.load(f)
+        except Exception:
             continue
-        score = result
-        sem_passed = score["details"].get("semantic_passed", True)
-        sem_score = score["details"].get("semantic_score", 0.0)
-        sem_tag = "✓" if sem_passed else "✗"
-        tools_used_list = score["details"].get("tools_used", [])
-        has_write_file = "write_file" in tools_used_list
-        jq_passed = score["details"].get("jq_audit_passed", True)
-        tool_ok = "✓" if (score["details"].get("mode") == "tool_call" or (has_write_file and jq_passed)) else "✗"
-        compile_ok = score["details"].get("compile_ok", False)
-        hash_match = score["details"].get("hash_match", False)
-        thinking_support = score["details"].get("thinking_support", False)
-        think_tag = "✓" if thinking_support else "✗"
-        used_retrieval = score["details"].get("used_retrieval", False)
-        retr_tag = "✓" if used_retrieval else "✗"
-        large_n_match = score["details"].get("large_n_match", False)
-        large_n_err = score["details"].get("large_n_error", "")
-        large_n_tag = "✓" if large_n_match else ("E" if large_n_err else "✗")
-        large_n2_match = score["details"].get("large_n2_match", False)
-        large_n2_err = score["details"].get("large_n2_error", "")
-        large_n2_tag = "✓" if large_n2_match else ("E" if large_n2_err else "✗")
-        total_violations = (
-            score["details"].get("javac_warnings", 0) +
-            score["details"].get("checkstyle_count", 0) +
-            score["details"].get("pmd_count", 0)
-        )
-        turns_used = score["details"].get("turns_used", 0)
-        exec_secs = score["details"].get("exec_time", 0)
-        model_time_secs = score["details"].get("model_time_seconds", 0)
-        model_name_short = model[:25] if len(model) > 25 else model
+        run_dir = os.path.dirname(sp)
+        # Recover the model name from the run_dir layout: results/<model>/<ts>/
+        model = os.path.basename(os.path.dirname(run_dir))
+        results_summary.append(score_to_row(model, run_dir, score))
 
-        results_summary.append({
-            "model": model,
-            "model_short": model_name_short,
-            "score": score["total"],
-            "correct": score["correctness"],
-            "compile_ok": compile_ok,
-            "hash_match": hash_match,
-            "speed": score["speed_score"],
-            "quality": score["code_quality"],
-            "tools": score["tool_usage"],
-            "violations": total_violations,
-            "turns_used": turns_used,
-            "exec_time_secs": round(exec_secs, 3),
-            "exec_str": format_time(exec_secs) if exec_secs > 0 else "-",
-            "model_time_secs": model_time_secs,
-            "time_str": format_time(model_time_secs),
-            "gen_tok_s": score["details"].get("gen_tok_s", 0.0),
-            "tools_used": ", ".join(tools_used_list),
-            "mode": score["details"].get("mode", "?"),
-            "javac_w": score["details"].get("javac_warnings", 0),
-            "cs": score["details"].get("checkstyle_count", 0),
-            "pmd": score["details"].get("pmd_count", 0),
-            "sem_tag": sem_tag,
-            "sem_score": round(sem_score, 2),
-            "tool_ok": tool_ok,
-            "think_tag": think_tag,
-            "thinking_support": thinking_support,
-            "think_score": score["details"].get("thinking_quality", 0),
-            "thinking_quality_chunks": score["details"].get("thinking_quality_chunks", 0),
-            "thinking_quality_mean_sim": score["details"].get("thinking_quality_mean_sim", 0),
-            "thinking_quality_error": score["details"].get("thinking_quality_error"),
-            "prompt_ts": score["details"].get("prompt_ts", 0.0),
-            "thinking_drift": score["details"].get("thinking_drift"),
-            "retr_tag": retr_tag,
-            "large_n_tag": large_n_tag,
-            "large_n2_tag": large_n2_tag,
-            "used_retrieval": used_retrieval,
-            "jq_passed": jq_passed,
-            "has_write_file": has_write_file,
-            "run_dir": run_dir
-        })
+    if not results_summary:
+        print("No score.json files found to rank.")
+        return results_summary
 
     results_summary.sort(key=lambda x: x["score"], reverse=True)
+    _write_ranking(results_summary)
+    return results_summary
 
+
+def _write_ranking(results_summary):
+    """Render the console + markdown ranking tables (shared by main() and
+    regenerate_ranking())."""
     # ── Single column-spec drives BOTH console + markdown tables (alignment-safe) ──
-    # (key, console_header, console_width, md_header)
     COLS = [
         ("rank",    "RANK",  5,   "RANK"),
         ("model",   "MODEL", 25,  "MODEL"),
@@ -1875,6 +1893,49 @@ def main():
         f.write(md_content)
     print(f"Ranking (markdown) saved to {ranking_md}")
 
+
+def main():
+    os.makedirs(RESULTS_BASE, exist_ok=True)
+
+    resp = requests.get("http://localhost:11434/api/tags", timeout=10)
+    resp.raise_for_status()
+    models = [m["name"] for m in resp.json().get("models", [])]
+
+    if not models:
+        print("No models found.")
+        sys.exit(1)
+
+    print(f"Found {len(models)} models:")
+    for m in models:
+        print(f"  - {m}")
+
+    # Filter out non-chat models (e.g. embedding-only) up front; report them.
+    chat_models = []
+    skipped_models = []
+    for m in models:
+        caps = get_model_capabilities(m)
+        if "completion" in caps:
+            chat_models.append(m)
+        else:
+            skipped_models.append((m, sorted(caps) or "none"))
+    if skipped_models:
+        print(f"\nSkipping {len(skipped_models)} non-chat model(s):")
+        for m, caps in skipped_models:
+            print(f"  - {m} (capabilities: {caps})")
+
+    results_summary = []
+
+    for model in chat_models:
+        result, run_dir = run_model_benchmark(model)
+        if isinstance(result, dict) and result.get("skipped"):
+            print(f"  (skipped {model}: {result.get('reason')})")
+            continue
+        score = result
+        results_summary.append(score_to_row(model, run_dir, score))
+
+    results_summary.sort(key=lambda x: x["score"], reverse=True)
+    _write_ranking(results_summary)
+
     # Completion sentinel — lets the supervisor know all models finished.
     try:
         with open(os.path.join(RESULTS_BASE, "benchmark_ALLDONE.sentinel"), "w") as f:
@@ -1884,4 +1945,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == "--regen":
+        regenerate_ranking()
+    else:
+        main()

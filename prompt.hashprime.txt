@@ -1,0 +1,36 @@
+Create the fastest possible single-file Java program named hashprime.java that takes one integer N from the command line. Generate all prime numbers from 2 to N using a Sieve of Eratosthenes. Write each prime to a temp file named tempoutput.txt followed by a single newline byte ('\n'). Compute the SHA-256 digest over those exact tempoutput.txt bytes and print ONLY that hash (as a lowercase hex string) to stdout. Do NOT delete tempoutput.txt yourself — the harness deletes it after hashing. The digest over the prime bytes for N=11 is exactly 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc, and N=12 is identical (12 is not prime), so both must produce that same hash.
+
+CORRECT HASH COMPUTATION (print the hex digest, NOT byte[].toString()):
+  MessageDigest md = MessageDigest.getInstance("SHA-256");
+  byte[] dig = md.digest(Files.readAllBytes(Paths.get("tempoutput.txt")));
+  StringBuilder sb = new StringBuilder();
+  for (byte b : dig) sb.append(String.format("%02x", b));
+  System.out.println(sb);   // prints e.g. 563d8e06...
+
+VALIDATION CONTRACT (the SHA-256 is computed over the tempoutput.txt prime bytes; stdout shows ONLY the hash):
+  Command:              java hashprime 11
+  Prime bytes :      2\n3\n5\n7\n11\n
+  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
+
+  Command:              java hashprime 12
+  Prime bytes :      2\n3\n5\n7\n11\n   (12 is not prime, so identical to N=11)
+  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
+
+  Command:              java hashprime 1000000
+  Expected SHA-256 (stdout):     4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
+
+  Command:              java hashprime 10000000
+  Expected SHA-256 (stdout):     36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
+
+Use public class hashprime (lowercase) to match the filename.
+Respond with a JSON tool call to use a tool, or plain text to communicate.
+
+Your program must produce the prime bytes (and therefore the matching digest) at ALL four scales — do not hardcode or special-case small N. The same algorithm must be correct from N=11 through N=10000000.
+
+HELPFUL TOOLS (use them to verify as you go):
+
+  - write_file        : save your code to hashprime.java
+  - compile_java      : compile it with javac
+  - run_and_hash      : run java hashprime N and return its SHA-256 — check it equals the expected digest above
+  - submit_answer     : submit your final hash when confident
+  - search_solutions  : query the indexed Qdrant reference corpora (prior hashprime.java solutions, algorithm patterns, sysadmin notes) for useful code — a positive signal, never penalized; improve on what you find rather than copying it
