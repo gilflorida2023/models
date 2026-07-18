@@ -134,6 +134,8 @@ Then confirm the SHA-256 hash of that output equals:
 
 Note: the hash depends only on the exact output bytes (each prime, then a single '\\n'). Whether you print to stdout or compute the digest another way is up to you — both are fine as long as the bytes are identical. Printing each prime followed by a newline (e.g. System.out.print(prime + "\\n")) is a perfectly valid approach.
 
+Your solution must be a real Sieve of Eratosthenes that works for any N, not just N=11 and N=12. In particular it must also handle large inputs such as one million (1,000,000) natural numbers correctly and efficiently — do not hardcode or special-case small values.
+
 Steps you should follow:
 1. Write the Java code to hashprime.java using the write_file tool
 2. Compile it using the compile_java tool
