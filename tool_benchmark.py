@@ -941,6 +941,14 @@ def try_compile_and_verify(run_dir):
     return result
 
 
+def _copy_large_n(timing, tcv):
+    """Copy the 1e6 validation results from a try_compile_and_verify result
+    into the run timing dict (text-mode paths otherwise drop them)."""
+    for k in ("large_n_match", "large_n_count_match", "large_n_exec_time",
+              "large_n_hash", "large_n_error", "large_n_count"):
+        timing[k] = tcv.get(k)
+
+
 _PROMPT_TS_CACHE = None
 
 
@@ -1264,7 +1272,8 @@ def run_model_benchmark(model):
 
     messages = [{"role": "user", "content": PROMPT}]
     conversation = []
-    timing = {"total_seconds": 0, "lint_time": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "capabilities": sorted(capabilities)}
+    timing = {"total_seconds": 0, "lint_time": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "capabilities": sorted(capabilities),
+              "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None}
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
@@ -1449,6 +1458,7 @@ def run_model_benchmark(model):
                 timing["pmd_count"] = tcv["pmd_count"]
                 timing["lint_time"] = timing.get("lint_time", 0) + tcv["lint_time"]
                 timing["exec_time"] = timing.get("exec_time", 0) + tcv["exec_time"]
+                _copy_large_n(timing, tcv)
                 did_compile_verify = True
                 c_ok = tcv["compile_ok"]
                 h_match = tcv["hash_match"]
@@ -1500,6 +1510,7 @@ def run_model_benchmark(model):
                 timing["pmd_count"] = tcv["pmd_count"]
                 timing["lint_time"] = timing.get("lint_time", 0) + tcv["lint_time"]
                 timing["exec_time"] = timing.get("exec_time", 0) + tcv["exec_time"]
+                _copy_large_n(timing, tcv)
                 did_compile_verify = True
                 c_ok = tcv["compile_ok"]
                 h_match = tcv["hash_match"]
