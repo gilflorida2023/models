@@ -1,0 +1,5 @@
+numpy
+tqdm
+chonkie
+qdrant-client
+requests

@@ -232,3 +232,70 @@ All model outputs are archived in this directory:
 - `native_tool_results.txt` — consolidated results table
 - `tool_call_results.txt` — text-format results
 - `prompt.info` — the input prompt
+
+---
+
+## Usage (hashprime Tool-Calling Benchmark)
+
+The current benchmark (`tool_benchmark.py`) challenges each model to write a
+single-file `hashprime.java` (Sieve of Eratosthenes) and verifies correctness at
+four scales — N=11, N=12, one million (1,000,000) and ten million (10,000,000) —
+against the authoritative OEIS A000040 manifest (`manifests/A000040.json`,
+`ascii_integer_lf` formatting: each prime followed by a single newline).
+
+### Prerequisites
+
+```bash
+.venv/bin/pip install -r requirements.txt
+```
+
+`requirements.txt` provides: `numpy`, `tqdm`, `chonkie`, `qdrant-client`, `requests`.
+
+Both commands require a **local Ollama** running with the target chat models
+pulled. Embedding-dependent features (thinking-quality `TSCORE` and the
+`search_solutions` retrieval tool) use **Ollama `nomic-embed-text`** via
+`/api/embed`, plus the local Qdrant store at `qdrant_data/`. Pull it first:
+
+```bash
+ollama pull nomic-embed-text
+```
+
+### Ingest reference corpora — `ingest_corpora.py`
+
+Builds the Qdrant index used by `search_solutions` and thinking-quality scoring.
+No CLI arguments; honors the `INCLUDE_HELLO_ALGO` environment variable (off by
+default because the hello-algo textbook is 801 files and slow to embed).
+
+```bash
+# Default: ingests linux_server + hashprime_solutions only
+.venv/bin/python ingest_corpora.py
+
+# Include the hello-algo textbook (very slow — run overnight)
+INCLUDE_HELLO_ALGO=true nohup .venv/bin/python ingest_corpora.py > ingest_night.log 2>&1 &
+```
+
+- Local Qdrant store: `qdrant_data/`
+- Collections: `hashprime_solutions`, `linux_server`, `hello_algo`
+- Embeds via Ollama `nomic-embed-text` (768-dim, cosine distance)
+
+### Run the tool-calling benchmark — `tool_benchmark.py`
+
+No CLI arguments. At startup it queries live Ollama (`/api/tags`), then
+benchmarks every chat-capable model. Each model gets the hashprime task with
+tools (`write_file`, `compile_java`, `run_and_hash`, `submit_answer`,
+`search_solutions`); generated code is compiled and executed at all four scales.
+
+```bash
+.venv/bin/python tool_benchmark.py
+```
+
+Outputs (under `results/`):
+- `ranking.md` — human-readable ranking table
+- `ranking.json` — machine-readable results
+- `results/<model>/<timestamp>/hashprime.java` — each model's submission
+
+The `1E6` and `1E7` columns confirm the sieve scales: the hash of the prime
+list for N=1,000,000 and N=10,000,000 must match the A000040 manifest
+(`4883963d…` and `36d61978…` respectively). This neutralizes any
+"don't write a file" micro-optimization advantage, since at scale the algorithm
+dominates runtime.

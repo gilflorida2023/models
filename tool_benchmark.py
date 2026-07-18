@@ -20,27 +20,42 @@ MAX_TURNS = 10
 EXPECTED_HASH = "563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc"
 
 # Large-N validation: confirm the sieve actually scales (and isn't a hardcoded
-# small-N trick) by checking the prime list for N=1,000,000 against the
-# authoritative OEIS A000040 manifest (ascii_integer_lf formatting).
-LARGE_N = 1_000_000
+# small-N trick) by checking the prime list against the authoritative OEIS
+# A000040 manifest (ascii_integer_lf formatting) at two checkpoints.
 MANIFEST_PATH = "/home/scout/projects/math-kat/manifests/A000040.json"
-LARGE_N_EXPECTED_HASH = "4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28"
-LARGE_N_EXPECTED_COUNT = 78498
+LARGE_CHECKPOINTS = {
+    1_000_000: {"hash": "4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28", "count": 78498},
+    10_000_000: {"hash": "36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14", "count": 664579},
+}
 
 
-def load_manifest_hash():
-    """Load the authoritative 1e6 hash (and prime count) from the A000040 manifest.
-    Falls back to the hardcoded constants if the manifest is missing/unreadable."""
+def load_manifest_checkpoints():
+    """Load checkpoint hashes/counts from the A000040 manifest; fall back to the
+    hardcoded constants above if the manifest is missing/unreadable."""
+    out = {k: dict(v) for k, v in LARGE_CHECKPOINTS.items()}
     try:
         with open(MANIFEST_PATH) as f:
             data = json.load(f)
-        chk = data.get("checkpoint_hashes", {}).get(str(LARGE_N), {})
-        return chk.get("hash", LARGE_N_EXPECTED_HASH), chk.get("count", LARGE_N_EXPECTED_COUNT)
+        for n, chk in data.get("checkpoint_hashes", {}).items():
+            try:
+                ni = int(n)
+            except ValueError:
+                continue
+            if ni in out:
+                out[ni]["hash"] = chk.get("hash", out[ni]["hash"])
+                out[ni]["count"] = chk.get("count", out[ni]["count"])
     except Exception:
-        return LARGE_N_EXPECTED_HASH, LARGE_N_EXPECTED_COUNT
+        pass
+    return out
 
 
-LARGE_N_EXPECTED_HASH, LARGE_N_EXPECTED_COUNT = load_manifest_hash()
+MANIFEST_CP = load_manifest_checkpoints()
+LARGE_N = 1_000_000
+LARGE_N2 = 10_000_000
+LARGE_N_EXPECTED_HASH = MANIFEST_CP[LARGE_N]["hash"]
+LARGE_N_EXPECTED_COUNT = MANIFEST_CP[LARGE_N]["count"]
+LARGE_N2_EXPECTED_HASH = MANIFEST_CP[LARGE_N2]["hash"]
+LARGE_N2_EXPECTED_COUNT = MANIFEST_CP[LARGE_N2]["count"]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(BASE_DIR, "tools")
@@ -124,7 +139,17 @@ Tool: search_solutions
 PROMPT = """You are solving a Java programming challenge. You have access to tools to write files, compile, run commands, and verify results.
 """ + TOOL_DESCRIPTIONS + """
 Your task:
-Create a single-file Java program called hashprime.java that reads one integer N from the command line, generates all primes from 2 to N using a Sieve of Eratosthenes, and writes each prime on its own line followed by a newline. The exact output bytes for N=11 and N=12 must be:
+Create a single-file Java program called hashprime.java that reads one integer N from the command line, generates all primes from 2 to N using a Sieve of Eratosthenes, and writes each prime on its own line followed by a newline.
+
+RANGE OF THE CHALLENGE (up front):
+Your solution will be validated at FOUR scales, and the output bytes must be exactly correct at every one of them:
+  - N = 11      (21 bytes: 2\\n3\\n5\\n7\\n11\\n)
+  - N = 12      (same shape, one more prime: 2\\n3\\n5\\n7\\n11\\n)
+  - N = 1,000,000        (one million — 78498 primes; the output is large)
+  - N = 10,000,000       (ten million — 664579 primes; the output is very large)
+Do not special-case or hardcode any of these. The same algorithm must produce correct output at all four scales. Plan for the large scales from the start — memory and throughput matter at ten million.
+
+The exact output bytes for N=11 and N=12 must be:
 
 2\\n3\\n5\\n7\\n11\\n
 
@@ -135,6 +160,8 @@ Then confirm the SHA-256 hash of that output equals:
 Note: the hash depends only on the exact output bytes (each prime, then a single '\\n'). Whether you print to stdout or compute the digest another way is up to you — both are fine as long as the bytes are identical. Printing each prime followed by a newline (e.g. System.out.print(prime + "\\n")) is a perfectly valid approach.
 
 Your solution must be a real Sieve of Eratosthenes that works for any N, not just N=11 and N=12. In particular it must also handle large inputs such as one million (1,000,000) natural numbers correctly and efficiently — do not hardcode or special-case small values.
+
+Once your basic sieve is correct, you must also scale it PAST one million. We need a solution that EXCEEDS the speed of a naive boolean-array sieve when N grows large (e.g. ten million / 10,000,000 and beyond). Achieve this by improving the algorithm, not by micro-tuning I/O: use an odds-only sieve, a bit-packed BitSet, and/or a segmented sieve so memory stays bounded and throughput stays high at large N. The output bytes are identical to the naive sieve — only the runtime should improve. Make sure the program still reads N from the command line and emits the exact same prime list for any N.
 
 Steps you should follow:
 1. Write the Java code to hashprime.java using the write_file tool
@@ -825,6 +852,34 @@ def thinking_quality_score(thinking_text):
 
 # === Compile and verify (used for text-only models) ===
 
+def _verify_large_n(run_dir, n, exp_hash, exp_count, prefix):
+    """Run hashprime at N=n, hash the output, compare to the manifest.
+    Returns (match, count_match, exec_time, hash, error)."""
+    rd_abs = os.path.abspath(run_dir)
+    start = time.time()
+    try:
+        r = subprocess.run(
+            ["java", "-cp", rd_abs, "hashprime", str(n)],
+            capture_output=True, text=True, timeout=600, cwd=rd_abs
+        )
+        exec_time = time.time() - start
+        if r.returncode == 0:
+            out = r.stdout
+            h = hashlib.sha256(out.encode()).hexdigest()
+            match = (h == exp_hash)
+            try:
+                cnt = sum(1 for line in out.split("\n") if line.strip())
+            except Exception:
+                cnt = None
+            count_match = (cnt == exp_count)
+            print(f"  ── large-N ({prefix}) ── hash_match={match} "
+                  f"count_match={count_match} ({exec_time:.2f}s)")
+            return match, count_match, exec_time, h, ""
+        return False, False, exec_time, "", f"java rc={r.returncode}: {r.stderr[:200]}"
+    except Exception as e:
+        return False, False, time.time() - start, "", str(e)
+
+
 def try_compile_and_verify(run_dir):
     """Compile hashprime.java, run it, check hash, run lint tools.
     Returns dict with compile_ok, hash_match, javac_warnings, checkstyle_count, pmd_count, lint_time, exec_time, output."""
@@ -834,6 +889,8 @@ def try_compile_and_verify(run_dir):
         "checkstyle_count": 0, "pmd_count": 0, "lint_time": 0, "exec_time": 0, "output": "",
         "large_n_match": False, "large_n_count_match": False,
         "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "",
+        "large_n2_match": False, "large_n2_count_match": False,
+        "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": "",
     }
     if not os.path.exists(java_file):
         return result
@@ -907,36 +964,15 @@ def try_compile_and_verify(run_dir):
         except:
             pass
 
-    # Large-N validation (N=1e6): proves the sieve scales and isn't a
-    # hardcoded small-N trick. Compares to the authoritative A000040 manifest.
-    start = time.time()
-    try:
-        r = subprocess.run(
-            ["java", "-cp", run_dir, "hashprime", str(LARGE_N)],
-            capture_output=True, text=True, timeout=300, cwd=run_dir
-        )
-        result["large_n_exec_time"] = time.time() - start
-        if r.returncode == 0:
-            out = r.stdout
-            result["large_n_hash"] = hashlib.sha256(out.encode()).hexdigest()
-            result["large_n_match"] = (result["large_n_hash"] == LARGE_N_EXPECTED_HASH)
-            # Count primes (lines that parse as integers), compare to manifest count
-            try:
-                cnt = sum(1 for line in out.split("\n") if line.strip())
-                result["large_n_count"] = cnt
-                result["large_n_count_match"] = (cnt == LARGE_N_EXPECTED_COUNT)
-            except Exception:
-                pass
-            print(f"  ── large-N (1e6) ── hash_match={result['large_n_match']} "
-                  f"count_match={result['large_n_count_match']} "
-                  f"({result['large_n_exec_time']:.2f}s)")
-        else:
-            result["large_n_error"] = f"java rc={r.returncode}: {r.stderr[:200]}"
-            print(f"  ── large-N (1e6) java failed rc={r.returncode}: {r.stderr[:200]}")
-    except Exception as e:
-        result["large_n_exec_time"] = time.time() - start
-        result["large_n_error"] = str(e)
-        print(f"  ── large-N (1e6) FAILED: {e}")
+    # Large-N validation against the A000040 manifest at two checkpoints.
+    # Proves the sieve scales and isn't a hardcoded small-N trick.
+    m, cm, et, h, err = _verify_large_n(run_dir, LARGE_N, LARGE_N_EXPECTED_HASH, LARGE_N_EXPECTED_COUNT, "1e6")
+    result["large_n_match"], result["large_n_count_match"] = m, cm
+    result["large_n_exec_time"], result["large_n_hash"], result["large_n_error"] = et, h, err
+
+    m2, cm2, et2, h2, err2 = _verify_large_n(run_dir, LARGE_N2, LARGE_N2_EXPECTED_HASH, LARGE_N2_EXPECTED_COUNT, "1e7")
+    result["large_n2_match"], result["large_n2_count_match"] = m2, cm2
+    result["large_n2_exec_time"], result["large_n2_hash"], result["large_n2_error"] = et2, h2, err2
 
     return result
 
@@ -945,7 +981,9 @@ def _copy_large_n(timing, tcv):
     """Copy the 1e6 validation results from a try_compile_and_verify result
     into the run timing dict (text-mode paths otherwise drop them)."""
     for k in ("large_n_match", "large_n_count_match", "large_n_exec_time",
-              "large_n_hash", "large_n_error", "large_n_count"):
+              "large_n_hash", "large_n_error", "large_n_count",
+              "large_n2_match", "large_n2_count_match", "large_n2_exec_time",
+              "large_n2_hash", "large_n2_error"):
         timing[k] = tcv.get(k)
 
 
@@ -1015,6 +1053,11 @@ def score_run(run_dir, conversation, timing, mode):
     score["details"]["large_n_exec_time"] = timing.get("large_n_exec_time", 0)
     score["details"]["large_n_hash"] = timing.get("large_n_hash", "")
     score["details"]["large_n_error"] = timing.get("large_n_error", "")
+    score["details"]["large_n2_match"] = timing.get("large_n2_match", False)
+    score["details"]["large_n2_count_match"] = timing.get("large_n2_count_match", False)
+    score["details"]["large_n2_exec_time"] = timing.get("large_n2_exec_time", 0)
+    score["details"]["large_n2_hash"] = timing.get("large_n2_hash", "")
+    score["details"]["large_n2_error"] = timing.get("large_n2_error", "")
 
     # Speed (exclude lint time from model's speed score)
     total_time = timing.get("total_seconds", 999)
@@ -1172,7 +1215,8 @@ Result:   {'✓ PASS' if score['correctness'] >= 100 else '✗ FAIL'}
 Time:     {human_model} model + {human_lint} lint = {human_total} wall  (score: {score['speed_score']}/100)
 Correct:  {'Yes - hash matches expected' if score['correctness'] >= 100 else 'No - wrong hash'}
 Compiled: {'Yes' if score['details'].get('compile_ok') else 'No'}
-Large-N:  {'Yes - 1e6 hash matches A000040 manifest' if score['details'].get('large_n_match') else ('ERR - check failed: ' + str(score['details'].get('large_n_error', ''))[:60] if score['details'].get('large_n_error') else 'No - 1e6 hash mismatch')} ({score['details'].get('large_n_exec_time', 0):.2f}s)
+Large-N (1e6):  {'Yes - hash matches A000040 manifest' if score['details'].get('large_n_match') else ('ERR - check failed: ' + str(score['details'].get('large_n_error', ''))[:60] if score['details'].get('large_n_error') else 'No - 1e6 hash mismatch')} ({score['details'].get('large_n_exec_time', 0):.2f}s)
+Large-N (1e7):  {'Yes - hash matches A000040 manifest' if score['details'].get('large_n2_match') else ('ERR - check failed: ' + str(score['details'].get('large_n2_error', ''))[:60] if score['details'].get('large_n2_error') else 'No - 1e7 hash mismatch')} ({score['details'].get('large_n2_exec_time', 0):.2f}s)
 Quality:  {lint_str}  (score: {score['code_quality']}/100 — higher=cleaner)
 Tokens:   {prompt_tokens} sent + {completion_tokens} generated = {prompt_tokens + completion_tokens} total  (gen {gen_tok_s:.1f} tok/s, prompt {prompt_tok_s:.1f} tok/s){token_block}
 Tools:    [{tools_used}]  (score: {score['tool_usage']}/100 — higher=more tools used)
@@ -1273,7 +1317,8 @@ def run_model_benchmark(model):
     messages = [{"role": "user", "content": PROMPT}]
     conversation = []
     timing = {"total_seconds": 0, "lint_time": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "capabilities": sorted(capabilities),
-              "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None}
+              "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None,
+              "large_n2_match": False, "large_n2_count_match": False, "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": ""}
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
@@ -1595,6 +1640,9 @@ def main():
         large_n_match = score["details"].get("large_n_match", False)
         large_n_err = score["details"].get("large_n_error", "")
         large_n_tag = "✓" if large_n_match else ("E" if large_n_err else "✗")
+        large_n2_match = score["details"].get("large_n2_match", False)
+        large_n2_err = score["details"].get("large_n2_error", "")
+        large_n2_tag = "✓" if large_n2_match else ("E" if large_n2_err else "✗")
         total_violations = (
             score["details"].get("javac_warnings", 0) +
             score["details"].get("checkstyle_count", 0) +
@@ -1640,6 +1688,7 @@ def main():
             "thinking_drift": score["details"].get("thinking_drift"),
             "retr_tag": retr_tag,
             "large_n_tag": large_n_tag,
+            "large_n2_tag": large_n2_tag,
             "used_retrieval": used_retrieval,
             "jq_passed": jq_passed,
             "has_write_file": has_write_file,
@@ -1669,6 +1718,7 @@ def main():
         ("time",    "MTIME", 10,  "MTIME"),
         ("tok_s",   "TOK/s", 7,   "TOK/s"),
         ("large",   "1E6",   5,   "1E6"),
+        ("large2",  "1E7",   5,   "1E7"),
         ("mode",    "MODE",  8,   "MODE"),
     ]
 
@@ -1696,6 +1746,7 @@ def main():
             "time": r["time_str"],
             "tok_s": f"{r['gen_tok_s']:.1f}",
             "large": r["large_n_tag"],
+            "large2": r["large_n2_tag"],
             "mode": r["mode"],
         }
 
@@ -1742,6 +1793,7 @@ def main():
         "- **MTIME**: total model wall-clock time excluding lint (seconds or minutes)",
         "- **TOK/s**: generation throughput — completion tokens per second of model wall-clock time (higher = faster generation)",
         "- **1E6**: does the sieve scale? Hash of the prime list for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). ✓ = matches, ✗ = hash mismatch (wrong sieve), E = the 1e6 check itself errored/timed out (indeterminate — not a model fail). This neutralizes any 'don't write a file' micro-optimization advantage, since at 1e6 the algorithm dominates runtime.",
+        "- **1E7**: does the faster-than-naive sieve scale to N=10,000,000? Same manifest hash/check (664579 primes). ✓ = matches, ✗ = hash mismatch, E = check errored/timed out. Confirms the optimized algorithm (segmented / bit-packed / odds-only) produces identical output at scale and runs faster than the naive boolean[] sieve.",
         "- **MODE**: `tool_call` = native Ollama tool API, `text` = JSON extracted from plaintext",
         "",
     ])
@@ -1798,6 +1850,13 @@ def main():
     with open(ranking_md, "w") as f:
         f.write(md_content)
     print(f"Ranking (markdown) saved to {ranking_md}")
+
+    # Completion sentinel — lets the supervisor know all models finished.
+    try:
+        with open(os.path.join(RESULTS_BASE, "benchmark_ALLDONE.sentinel"), "w") as f:
+            f.write(f"done {datetime.now().isoformat()}\n")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

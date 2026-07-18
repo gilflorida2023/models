@@ -8,7 +8,7 @@ Corpora:
 
 Uses Qdrant in local persistent mode (no server binary needed).
 Uses Ollama's nomic-embed-text for fast, local embeddings.
-Uses fastembed with nomic-embed-text-v1.5 (local ONNX, no PyTorch).
+Uses Ollama nomic-embed-text via /api/embed (local, no external API).
 """
 
 import os, hashlib, re, subprocess, requests, numpy as np
