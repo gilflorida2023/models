@@ -294,8 +294,10 @@ Outputs (under `results/`):
 - `ranking.json` — machine-readable results
 - `results/<model>/<timestamp>/hashprime.java` — each model's submission
 
-The `1E6` and `1E7` columns confirm the sieve scales: the hash of the prime
-list for N=1,000,000 and N=10,000,000 must match the A000040 manifest
-(`4883963d…` and `36d61978…` respectively). This neutralizes any
-"don't write a file" micro-optimization advantage, since at scale the algorithm
-dominates runtime.
+The `1E6` and `1E7` columns confirm the sieve scales: each model writes its
+prime list to `tempoutput.txt` (one prime per line + `\\n`), then the harness
+hashes those exact bytes — the SHA-256 for N=1,000,000 and N=10,000,000 must
+match the A000040 manifest (`4883963d…` and `36d61978…` respectively). The
+program prints ONLY the hash to stdout; the temp file is deleted after hashing.
+This neutralizes any "don't write a file" micro-optimization advantage, since at
+scale the algorithm dominates runtime.

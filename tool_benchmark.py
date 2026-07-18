@@ -138,42 +138,35 @@ Tool: search_solutions
 
 PROMPT = """You are solving a Java programming challenge. You have access to tools to write files, compile, run commands, and verify results.
 """ + TOOL_DESCRIPTIONS + """
-Your task:
-Create a single-file Java program called hashprime.java that reads one integer N from the command line, generates all primes from 2 to N using a Sieve of Eratosthenes, and writes each prime on its own line followed by a newline.
+Create the fastest possible single-file Java program named hashprime.java that takes one integer N from the command line. Generate all prime numbers from 2 to N using a Sieve of Eratosthenes. Write each prime to a temp file named tempoutput.txt followed by a single newline byte ('\\n'). Compute the SHA-256 digest over those exact tempoutput.txt bytes and print ONLY that hash to stdout. The temp file is deleted after hashing, so it must not be left behind. The digest over the prime bytes for N=11 is exactly 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc, and N=12 is identical (12 is not prime), so both must produce that same hash.
 
-RANGE OF THE CHALLENGE (up front):
-Your solution will be validated at FOUR scales, and the output bytes must be exactly correct at every one of them:
-  - N = 11      (21 bytes: 2\\n3\\n5\\n7\\n11\\n)
-  - N = 12      (same shape, one more prime: 2\\n3\\n5\\n7\\n11\\n)
-  - N = 1,000,000        (one million — 78498 primes; the output is large)
-  - N = 10,000,000       (ten million — 664579 primes; the output is very large)
-Do not special-case or hardcode any of these. The same algorithm must produce correct output at all four scales. Plan for the large scales from the start — memory and throughput matter at ten million.
+VALIDATION CONTRACT (the SHA-256 is computed over the tempoutput.txt prime bytes; stdout shows ONLY the hash):
+  Command:              java hashprime 11
+  Prime bytes (in tempoutput.txt):      2\\n3\\n5\\n7\\n11\\n
+  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
 
-The exact output bytes for N=11 and N=12 must be:
+  Command:              java hashprime 12
+  Prime bytes (in tempoutput.txt):      2\\n3\\n5\\n7\\n11\\n   (12 is not prime, so identical to N=11)
+  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
 
-2\\n3\\n5\\n7\\n11\\n
+  Command:              java hashprime 1000000
+  Expected SHA-256 (stdout):     4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
+  Command:              java hashprime 10000000
+  Expected prime count: 664579
+  Expected SHA-256 (stdout):     36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
 
-Then confirm the SHA-256 hash of that output equals:
-
-563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
-
-Note: the hash depends only on the exact output bytes (each prime, then a single '\\n'). Whether you print to stdout or compute the digest another way is up to you — both are fine as long as the bytes are identical. Printing each prime followed by a newline (e.g. System.out.print(prime + "\\n")) is a perfectly valid approach.
-
-Your solution must be a real Sieve of Eratosthenes that works for any N, not just N=11 and N=12. In particular it must also handle large inputs such as one million (1,000,000) natural numbers correctly and efficiently — do not hardcode or special-case small values.
-
-Once your basic sieve is correct, you must also scale it PAST one million. We need a solution that EXCEEDS the speed of a naive boolean-array sieve when N grows large (e.g. ten million / 10,000,000 and beyond). Achieve this by improving the algorithm, not by micro-tuning I/O: use an odds-only sieve, a bit-packed BitSet, and/or a segmented sieve so memory stays bounded and throughput stays high at large N. The output bytes are identical to the naive sieve — only the runtime should improve. Make sure the program still reads N from the command line and emits the exact same prime list for any N.
-
-Steps you should follow:
-1. Write the Java code to hashprime.java using the write_file tool
-2. Compile it using the compile_java tool
-3. Run it and compute the hash using run_and_hash. Verify it matches the expected hash
-4. Confirm that N=11 and N=12 produce the same output
-5. Submit your answer with submit_answer when you are confident
-
-Important: use `public class hashprime` (lowercase) to match the filename.
+Use public class hashprime (lowercase) to match the filename.
 Respond with a JSON tool call to use a tool, or plain text to communicate.
 
-Optional: you may call search_solutions to retrieve prior solutions and algorithm patterns from the indexed reference corpus. If you view a sample solution, improve on it rather than copying it verbatim — aim for a cleaner or more correct implementation."""
+Your program must produce the matching bytes (and therefore the matching digest) at ALL four scales — do not hardcode or special-case small N. The same algorithm must be correct from N=11 through N=10000000.
+
+HELPFUL TOOLS (use them to verify as you go):
+
+  - write_file        : save your code to hashprime.java
+  - compile_java      : compile it with javac
+  - run_and_hash      : run java hashprime N and return its SHA-256 — check it equals the expected digest above
+  - submit_answer     : submit your final hash when confident
+  - search_solutions  : query the indexed Qdrant reference corpora (prior hashprime.java solutions, algorithm patterns, sysadmin notes) for useful code — a positive signal, never penalized; improve on what you find rather than copying it"""
 
 
 # === Code extraction ===
@@ -472,7 +465,18 @@ def tool_run_and_hash(args, run_dir):
         if result.returncode != 0:
             return json.dumps({"ok": False, "returncode": result.returncode, "stderr": result.stderr})
         output = result.stdout
-        sha = hashlib.sha256(output.encode()).hexdigest()
+        # The program writes primes to tempoutput.txt and prints ONLY the hash
+        # to stdout. Validate by hashing the prime bytes in tempoutput.txt.
+        tmp_path = os.path.join(run_dir, "tempoutput.txt")
+        if not os.path.exists(tmp_path):
+            return json.dumps({"ok": False, "error": "tempoutput.txt not found — program must write primes there (stdout shows only the hash)"})
+        with open(tmp_path, "rb") as f:
+            prime_bytes = f.read()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        sha = hashlib.sha256(prime_bytes).hexdigest()
         return json.dumps({
             "ok": True,
             "n": n,
@@ -864,11 +868,20 @@ def _verify_large_n(run_dir, n, exp_hash, exp_count, prefix):
         )
         exec_time = time.time() - start
         if r.returncode == 0:
-            out = r.stdout
-            h = hashlib.sha256(out.encode()).hexdigest()
+            # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
+            tmp_path = os.path.join(rd_abs, "tempoutput.txt")
+            if not os.path.exists(tmp_path):
+                return False, False, exec_time, "", f"tempoutput.txt not found — program must write primes there"
+            with open(tmp_path, "rb") as f:
+                out = f.read()
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            h = hashlib.sha256(out).hexdigest()
             match = (h == exp_hash)
             try:
-                cnt = sum(1 for line in out.split("\n") if line.strip())
+                cnt = sum(1 for line in out.split(b"\n") if line.strip())
             except Exception:
                 cnt = None
             count_match = (cnt == exp_count)
@@ -958,9 +971,20 @@ def try_compile_and_verify(run_dir):
             result["exec_time"] += time.time() - start
             if r.returncode == 0:
                 result["output"] = r.stdout
-                sha = hashlib.sha256(r.stdout.encode()).hexdigest()
-                if sha == EXPECTED_HASH:
-                    result["hash_match"] = True
+                # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
+                tmp_path = os.path.join(run_dir, "tempoutput.txt")
+                if os.path.exists(tmp_path):
+                    with open(tmp_path, "rb") as f:
+                        prime_bytes = f.read()
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    sha = hashlib.sha256(prime_bytes).hexdigest()
+                    if sha == EXPECTED_HASH:
+                        result["hash_match"] = True
+                else:
+                    result["hash_match"] = False
         except:
             pass
 
@@ -1522,7 +1546,7 @@ def run_model_benchmark(model):
                     messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
-                        "content": f"The code compiled successfully but the SHA-256 hash doesn't match {EXPECTED_HASH}. The output produces hash that doesn't match. Remember: the input bytes should be '2\\n3\\n5\\n7\\n11\\n' and the hash should match. Make sure to use Sieve of Eratosthenes and feed primes directly to SHA-256 with newlines."
+                        "content": f"The code compiled successfully but the SHA-256 hash doesn't match {EXPECTED_HASH}. Write each prime followed by '\\n' to tempoutput.txt, compute the SHA-256 over those bytes, print ONLY that hash to stdout, then the temp file is deleted. The prime bytes for N=11 are '2\\n3\\n5\\n7\\n11\\n' and their digest must be {EXPECTED_HASH}."
                     })
                     continue
                 else:
@@ -1792,7 +1816,7 @@ def main():
         "- **EXEC**: time for compiled Java code to execute (seconds)",
         "- **MTIME**: total model wall-clock time excluding lint (seconds or minutes)",
         "- **TOK/s**: generation throughput — completion tokens per second of model wall-clock time (higher = faster generation)",
-        "- **1E6**: does the sieve scale? Hash of the prime list for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). ✓ = matches, ✗ = hash mismatch (wrong sieve), E = the 1e6 check itself errored/timed out (indeterminate — not a model fail). This neutralizes any 'don't write a file' micro-optimization advantage, since at 1e6 the algorithm dominates runtime.",
+        "- **1E6**: does the sieve scale? Hash of the prime list (written by the model to tempoutput.txt, one prime per line + '\\n', then hashed) for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). ✓ = matches, ✗ = hash mismatch (wrong sieve), E = the 1e6 check itself errored/timed out (indeterminate — not a model fail). At 1e6 the algorithm dominates runtime, so this neutralizes any 'don't write a file' micro-optimization advantage.",
         "- **1E7**: does the faster-than-naive sieve scale to N=10,000,000? Same manifest hash/check (664579 primes). ✓ = matches, ✗ = hash mismatch, E = check errored/timed out. Confirms the optimized algorithm (segmented / bit-packed / odds-only) produces identical output at scale and runs faster than the naive boolean[] sieve.",
         "- **MODE**: `tool_call` = native Ollama tool API, `text` = JSON extracted from plaintext",
         "",
