@@ -480,15 +480,29 @@ def tool_run(args, run_dir):
             return json.dumps({"ok": False, "returncode": result.returncode, "stderr": result.stderr})
         output = result.stdout
         # The program prints ONLY the SHA-256 hash (lowercase hex) to stdout.
-        # Validate by comparing that printed hash to the expected digest.
+        # Validate by comparing that printed hash against the EXPECTED digest for
+        # the requested N: small-N (n in {11,12}) uses EXPECTED_HASH; the large-N
+        # checkpoints use their manifest digests. For any other N we can't verify
+        # against a known digest, so matches_expected is None (unknown) rather
+        # than a misleading false.
         actual = output.strip().lower()
         sha = actual
+        if n in (11, 12):
+            expected = EXPECTED_HASH
+        elif n == LARGE_N:
+            expected = LARGE_N_EXPECTED_HASH
+        elif n == LARGE_N2:
+            expected = LARGE_N2_EXPECTED_HASH
+        else:
+            expected = None
+        matches = (sha == expected) if expected is not None else None
         return json.dumps({
             "ok": True,
             "n": n,
             "output": output,
             "sha256": sha,
-            "matches_expected": sha == EXPECTED_HASH,
+            "expected": expected,
+            "matches_expected": matches,
             "exec_time": round(exec_time, 3)
         })
     except subprocess.TimeoutExpired:
