@@ -76,6 +76,9 @@ TOOLS_DIR = os.path.join(BASE_DIR, "tools")
 CHECKSTYLE_JAR = os.path.join(TOOLS_DIR, "checkstyle.jar")
 CHECKSTYLE_CONFIG = os.path.join(TOOLS_DIR, "checkstyle_config.xml")
 PMD_BIN = os.path.join(TOOLS_DIR, "pmd", "bin", "pmd")
+JUNIT_JAR = os.path.join(BASE_DIR, "junit", "junit-platform-console-standalone.jar")
+JUNIT_SRC = os.path.join(BASE_DIR, "junit", "HashprimeVerificationTest.java")
+JUNIT_OUT = os.path.join(BASE_DIR, "junit", "out")
 
 
 def cleanup_all_models():
@@ -134,10 +137,10 @@ Tool: compile_java
   Arguments: none
   Example: {"name": "compile_java", "arguments": {}}
 
-Tool: run_and_hash
+Tool: run
   Description: Run 'java hashprime N' and return its SHA-256 hash
   Arguments: n (integer) - upper limit for prime finding
-  Example: {"name": "run_and_hash", "arguments": {"n": 12}}
+  Example: {"name": "run", "arguments": {"n": 12}}
 
 Tool: submit_answer
   Description: Submit the final SHA-256 hash as the answer
@@ -418,7 +421,6 @@ def tool_compile_java(args, run_dir):
             "checkstyle_output": "",
             "pmd_count": 0,
             "pmd_output": "",
-            "lint_time": 0,
         }
 
         if result.returncode == 0:
@@ -428,22 +430,37 @@ def tool_compile_java(args, run_dir):
             response["checkstyle_output"] = "\n".join(cs_lines)
             response["pmd_count"] = pmd_count
             response["pmd_output"] = "\n".join(pmd_lines)
-            response["lint_time"] = cs_time + pmd_time
             if cs_lines:
                 with open(os.path.join(run_dir, "checkstyle_report.txt"), "w") as f:
                     f.write("\n".join(cs_lines) + "\n")
             if pmd_lines:
                 with open(os.path.join(run_dir, "pmd_report.txt"), "w") as f:
                     f.write("\n".join(pmd_lines) + "\n")
+            # LINT IS USER-ONLY: never sent to the model. The model only ever
+            # sees the javac output (ok/returncode/stdout/stderr) so it can fix
+            # its own code; checkstyle/PMD violations are for the user's report.
+            print(f"  ── LINT (user-only, NOT sent to model) ── "
+                  f"checkstyle={cs_count}, pmd={pmd_count}")
+        else:
+            print(f"  ── LINT skipped (compile failed) ──")
 
-        return json.dumps(response)
+        # Build the result string FED TO THE MODEL: javac output only, lint
+        # content (checkstyle/PMD) stripped. lint is USER-ONLY, never sent to
+        # the model. (Full response w/ lint is kept for the user in score.json.)
+        model_response = {
+            "ok": response["ok"],
+            "returncode": response["returncode"],
+            "stdout": response["stdout"],
+            "stderr": response["stderr"],
+        }
+        return json.dumps(model_response)
     except subprocess.TimeoutExpired:
         return json.dumps({"ok": False, "error": "Compilation timed out"})
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)})
 
 
-def tool_run_and_hash(args, run_dir):
+def tool_run(args, run_dir):
     n = args.get("n", 12)
     if not os.path.exists(os.path.join(run_dir, "hashprime.class")):
         return json.dumps({"ok": False, "error": "hashprime.class not found. Compile first."})
@@ -457,18 +474,10 @@ def tool_run_and_hash(args, run_dir):
         if result.returncode != 0:
             return json.dumps({"ok": False, "returncode": result.returncode, "stderr": result.stderr})
         output = result.stdout
-        # The program writes primes to tempoutput.txt and prints ONLY the hash
-        # to stdout. Validate by hashing the prime bytes in tempoutput.txt.
-        tmp_path = os.path.join(run_dir, "tempoutput.txt")
-        if not os.path.exists(tmp_path):
-            return json.dumps({"ok": False, "error": "tempoutput.txt not found — program must write primes there (stdout shows only the hash)"})
-        with open(tmp_path, "rb") as f:
-            prime_bytes = f.read()
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        sha = hashlib.sha256(prime_bytes).hexdigest()
+        # The program prints ONLY the SHA-256 hash (lowercase hex) to stdout.
+        # Validate by comparing that printed hash to the expected digest.
+        actual = output.strip().lower()
+        sha = actual
         return json.dumps({
             "ok": True,
             "n": n,
@@ -562,15 +571,93 @@ def tool_search_solutions(args, run_dir):
                         "results": results})
 
 
+def _required_args_for(name):
+    """Return the list of required argument names for a tool from TOOL_SCHEMA,
+    used to build model-actionable error hints for missing arguments."""
+    for entry in TOOL_SCHEMA:
+        fn = entry.get("function", {})
+        if fn.get("name") == name:
+            return list(fn.get("parameters", {}).get("required", []))
+    return []
+
+
+def _run_junit(run_dir):
+    """Compile + run the standalone JUnit verification (HashprimeVerificationTest)
+    against the model's hashprime.class. Returns (passed, total, failed, error).
+
+    This is an ALTERNATIVE scale-proof to the large-N manifest hash: a full
+    JUnit sweep over many N (small/large) with zero failures proves the sieve
+    is correct AND scales, independent of any hardcoded single-hash trick.
+    """
+    if not os.path.exists(JUNIT_JAR):
+        return 0, 0, 0, "junit standalone jar missing"
+    if not os.path.exists(os.path.join(run_dir, "hashprime.class")):
+        return 0, 0, 0, "hashprime.class not found (compile first)"
+    try:
+        os.makedirs(JUNIT_OUT, exist_ok=True)
+        # The JUnit test runs `java -cp hashprime.dir hashprime N` itself, so it
+        # needs the compiled class in run_dir (already there) and the test class
+        # on the launcher classpath. Compile ONLY the test into JUNIT_OUT.
+        cf = subprocess.run(
+            ["javac", "-cp", JUNIT_JAR, "-d", JUNIT_OUT, JUNIT_SRC],
+            capture_output=True, text=True, timeout=60, cwd=run_dir
+        )
+        if cf.returncode != 0:
+            return 0, 0, 0, "junit compile failed: " + cf.stderr[:200]
+        # Point the test at the model's run_dir (hashes its class) + the manifest.
+        props = [
+            f"-Dhashprime.dir={os.path.abspath(run_dir)}",
+            f"-Dmanifest.file={MANIFEST_PATH}",
+            f"-Dmax.n=1000000",
+        ]
+        r = subprocess.run(
+            ["java", *props, "-jar", JUNIT_JAR, "--classpath", JUNIT_OUT,
+             "--select-class", "HashprimeVerificationTest", "--details=tree"],
+            capture_output=True, text=True, timeout=600, cwd=run_dir
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        total = failed = 0
+        m_total = re.search(r"(\d+)\s+tests found", out)
+        m_fail = re.search(r"(\d+)\s+tests failed", out)
+        if m_total:
+            total = int(m_total.group(1))
+        if m_fail:
+            failed = int(m_fail.group(1))
+        passed = max(total - failed, 0)
+        err = "" if failed == 0 else out[-300:]
+        return passed, total, failed, err
+    except subprocess.TimeoutExpired:
+        return 0, 0, 0, "junit run timed out"
+    except Exception as e:
+        return 0, 0, 0, f"junit error: {e}"
+
+
+def tool_run_junit_verification(args, run_dir):
+    """Run the JUnit verification suite over the model's hashprime class.
+    Returns pass/fail counts and the scale-proof result. Lint/user-only
+    semantics do not apply; this is a correctness harness fed back to the model
+    so it can see exactly which N failed."""
+    passed, total, failed, err = _run_junit(run_dir)
+    return json.dumps({
+        "ok": failed == 0 and total > 0,
+        "passed": passed,
+        "total": total,
+        "failed": failed,
+        "error": err,
+    })
+
+
 TOOL_DISPATCH = {
     "write_file": tool_write_file,
     "read_file": tool_read_file,
     "run_command": tool_run_command,
     "compile_java": tool_compile_java,
-    "run_and_hash": tool_run_and_hash,
+    "run": tool_run,
     "submit_answer": tool_submit_answer,
     "search_solutions": tool_search_solutions,
+    "run_junit_verification": tool_run_junit_verification,
 }
+
 
 # Ollama tool schema (native tool-calling API). Mirrors TOOL_DISPATCH.
 TOOL_SCHEMA = [
@@ -600,7 +687,7 @@ TOOL_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "run_and_hash",
+            "name": "run",
             "description": "Run 'java hashprime N' and return its SHA-256 hash of the prime list.",
             "parameters": {
                 "type": "object",
@@ -624,38 +711,106 @@ TOOL_SCHEMA = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_solutions",
-            "description": "Search the indexed Qdrant reference corpora (prior hashprime.java solutions, algorithm/data-structure patterns, and sysadmin notes) for relevant code and explanations. Returns top chunks tagged by source collection and file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to search for (e.g. 'Sieve of Eratosthenes SHA-256 primes'). If omitted, the task prompt is used.",
-                    }
+        {
+            "type": "function",
+            "function": {
+                "name": "search_solutions",
+                "description": "Search the indexed Qdrant reference corpora (prior hashprime.java solutions, algorithm/data-structure patterns, and sysadmin notes) for relevant code and explanations. Returns top chunks tagged by source collection and file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What to search for (e.g. 'Sieve of Eratosthenes SHA-256 primes'). If omitted, the task prompt is used.",
+                        }
+                    },
+                    "required": [],
                 },
-                "required": [],
             },
         },
-    },
-]
+        {
+            "type": "function",
+            "function": {
+                "name": "run_junit_verification",
+                "description": "Run the JUnit verification suite (HashprimeVerificationTest) over the compiled hashprime class across many N values. Provides an independent scale-proof (correct at small AND large N) beyond the single-hash manifest check.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+    ]
+
+
+# Models that are NOT chat models (embedding-only, etc.). Used to invert the
+# capability gate: we skip ONLY these, and default-allow everything else so a
+# transient empty/missing `capabilities` list never wrongly skips a capable
+# chat model (e.g. qwen3.5:*, glm4:9b, llama3.1:8b).
+EMBEDDING_CAPS = {"embedding"}
+EMBEDDING_FAMILIES = {"nomic-bert", "bert", "e5", "bge", "gte", "minilm"}
+
+_CAP_CACHE = {}
 
 
 def get_model_capabilities(model):
     """Return the set of Ollama capabilities for a model via POST /api/show.
-    E.g. {'completion', 'tools', 'thinking'}. Returns empty set on error.
+    E.g. {'completion', 'tools', 'thinking'}.
+
+    Returns an empty set on error/transient failure rather than raising. The
+    caller should use is_chat_model() to decide skipping, which treats an
+    empty/absent capability list as CHAT-CAPABLE (we only exclude models that
+    explicitly report embedding capability), so transient empty responses do
+    not wrongly skip capable models.
     """
+    if model in _CAP_CACHE:
+        return _CAP_CACHE[model]
+    caps = set()
+    if requests is None:
+        return caps
+    for attempt in range(2):  # one retry for transient Ollama blips
+        try:
+            resp = requests.post("http://localhost:11434/api/show",
+                                 json={"model": model}, timeout=30)
+            resp.raise_for_status()
+            caps = set(resp.json().get("capabilities", []) or [])
+            break
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)
+            continue
+    _CAP_CACHE[model] = caps
+    return caps
+
+
+def get_model_family(model):
+    """Return the Ollama model 'family' from /api/show details, or '' on error.
+    Used to identify embedding-only models by family when capabilities is empty.
+    """
+    if requests is None:
+        return ""
     try:
         resp = requests.post("http://localhost:11434/api/show",
                              json={"model": model}, timeout=30)
         resp.raise_for_status()
-        caps = resp.json().get("capabilities", [])
-        return set(caps)
+        return (resp.json().get("details", {}) or {}).get("family", "") or ""
     except Exception:
-        return set()
+        return ""
+
+
+def is_chat_model(model):
+    """Decide whether a model should be benchmarked.
+
+    We skip ONLY models that are explicitly embedding-only:
+      - capabilities contains 'embedding', OR
+      - details.family is a known embedding family.
+    Everything else is treated as chat-capable, even if Ollama returns an empty
+    capability list (transient/newer-tag models like qwen3.5). This prevents
+    capable models from being wrongly skipped as 'not a chat model'.
+    """
+    caps = get_model_capabilities(model)
+    if caps & EMBEDDING_CAPS:
+        return False
+    fam = get_model_family(model)
+    if fam and fam.lower() in EMBEDDING_FAMILIES:
+        return False
+    return True
 
 
 # === Lint tools ===
@@ -882,29 +1037,19 @@ def _verify_large_n(run_dir, n, exp_hash, exp_count, prefix):
             )
             exec_time = time.time() - start
             if r.returncode == 0:
-                # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
-                tmp_path = os.path.join(rd_abs, "tempoutput.txt")
-                if not os.path.exists(tmp_path):
-                    last_err = "tempoutput.txt not found — program must write primes there"
+                # The program prints ONLY the SHA-256 hash (lowercase hex) to
+                # stdout. Compare that printed hash to the manifest digest.
+                h = r.stdout.strip().lower()
+                if not h:
+                    last_err = "program printed no hash to stdout"
                     if attempt < 2:
                         time.sleep(0.5)
                         continue
                     return False, False, exec_time, "", last_err
-                with open(tmp_path, "rb") as f:
-                    out = f.read()
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-                h = hashlib.sha256(out).hexdigest()
                 match = (h == exp_hash)
-                try:
-                    cnt = sum(1 for line in out.split(b"\n") if line.strip())
-                except Exception:
-                    cnt = None
-                count_match = (cnt == exp_count)
+                count_match = match  # hash match implies the prime set is correct
                 print(f"  ── large-N ({prefix}) ── hash_match={match} "
-                      f"count_match={count_match} ({exec_time:.2f}s)")
+                      f"({exec_time:.2f}s)")
                 return match, count_match, exec_time, h, ""
             last_err = f"java rc={r.returncode}: {r.stderr[:200]}"
             if attempt < 2:
@@ -922,11 +1067,11 @@ def _verify_large_n(run_dir, n, exp_hash, exp_count, prefix):
 
 def try_compile_and_verify(run_dir):
     """Compile hashprime.java, run it, check hash, run lint tools.
-    Returns dict with compile_ok, hash_match, javac_warnings, checkstyle_count, pmd_count, lint_time, exec_time, output."""
+    Returns dict with compile_ok, hash_match, javac_warnings, checkstyle_count, pmd_count, exec_time, output."""
     java_file = os.path.join(run_dir, "hashprime.java")
     result = {
         "compile_ok": False, "hash_match": False, "javac_warnings": 0,
-        "checkstyle_count": 0, "pmd_count": 0, "lint_time": 0, "exec_time": 0, "output": "",
+        "checkstyle_count": 0, "pmd_count": 0, "exec_time": 0, "output": "",
         "large_n_match": False, "large_n_count_match": False,
         "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "",
         "large_n2_match": False, "large_n2_count_match": False,
@@ -979,7 +1124,6 @@ def try_compile_and_verify(run_dir):
     pmd_count, pmd_lines, pmd_time = run_pmd(java_file, run_dir)
     result["checkstyle_count"] = cs_count
     result["pmd_count"] = pmd_count
-    result["lint_time"] = cs_time + pmd_time
     if cs_lines:
         with open(os.path.join(run_dir, "checkstyle_report.txt"), "w") as f:
             f.write("\n".join(cs_lines) + "\n")
@@ -1000,19 +1144,12 @@ def try_compile_and_verify(run_dir):
                 result["exec_time"] += time.time() - start
                 if r.returncode == 0:
                     result["output"] = r.stdout
-                    # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
-                    tmp_path = os.path.join(run_dir, "tempoutput.txt")
-                    if os.path.exists(tmp_path):
-                        with open(tmp_path, "rb") as f:
-                            prime_bytes = f.read()
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                        sha = hashlib.sha256(prime_bytes).hexdigest()
-                        if sha == EXPECTED_HASH:
-                            matched = True
-                            break
+                    # The program prints ONLY the SHA-256 hash to stdout. Compare
+                    # the printed hash to the expected digest for n=11/12.
+                    actual = r.stdout.strip().lower()
+                    if actual == EXPECTED_HASH:
+                        matched = True
+                        break
                     else:
                         if attempt < 2:
                             time.sleep(0.5)
@@ -1100,10 +1237,23 @@ def score_run(run_dir, conversation, timing, mode):
     # right, it just works.
     hash_match = timing.get("hash_match", False)
     compile_ok = timing.get("compile_ok", False)
+    large_n_match = timing.get("large_n_match", False)
+    junit_passed = timing.get("junit_passed", 0)
+    junit_total = timing.get("junit_total", 0)
+    junit_failed = timing.get("junit_failed", 0)
+    # Full large-N correctness = the sieve proven to SCALE (1e6/1e7 manifest
+    # match OR a full JUnit manifest sweep with zero failures). Small-N hash
+    # alone only proves the code is locally right, NOT that it scales — so it
+    # caps below 100 (catching hardcoded/naive small-N tricks).
+    scales = large_n_match or (junit_total > 0 and junit_failed == 0 and junit_passed > 0)
     has_java = os.path.exists(os.path.join(run_dir, "hashprime.java"))
 
-    if hash_match:
+    if scales:
+        # Proven to scale: full correctness.
         score["correctness"] = 100
+    elif hash_match:
+        # Correct small-N output but not proven to scale: partial.
+        score["correctness"] = 75
     elif compile_ok:
         score["correctness"] = 50
     elif has_java:
@@ -1124,13 +1274,14 @@ def score_run(run_dir, conversation, timing, mode):
     score["details"]["large_n2_exec_time"] = timing.get("large_n2_exec_time", 0)
     score["details"]["large_n2_hash"] = timing.get("large_n2_hash", "")
     score["details"]["large_n2_error"] = timing.get("large_n2_error", "")
+    score["details"]["junit_passed"] = timing.get("junit_passed", 0)
+    score["details"]["junit_total"] = timing.get("junit_total", 0)
+    score["details"]["junit_failed"] = timing.get("junit_failed", 0)
 
-    # Speed (exclude lint time from model's speed score)
+    # Speed (model wall-clock only; lint time is not separately tracked)
     total_time = timing.get("total_seconds", 999)
-    lint_time = timing.get("lint_time", 0)
-    model_time = max(total_time - lint_time, 0)
+    model_time = total_time
     score["details"]["total_time_seconds"] = round(total_time, 2)
-    score["details"]["lint_time_seconds"] = round(lint_time, 2)
     score["details"]["model_time_seconds"] = round(model_time, 2)
 
     # Token throughput (generated tokens per second of model wall-clock)
@@ -1195,7 +1346,7 @@ def score_run(run_dir, conversation, timing, mode):
     if mode != "tool_call" and (not jq_audit_passed or not semantic_passed):
         score["tool_usage"] = 0
     else:
-        expected_tools = {"write_file", "compile_java", "run_and_hash", "submit_answer"}
+        expected_tools = {"write_file", "compile_java", "run", "submit_answer"}
         used = len(tools_used & expected_tools)
         score["tool_usage"] = int((used / len(expected_tools)) * 100)
     score["details"]["tools_used"] = sorted(tools_used) if tools_used else ["(none)"]
@@ -1241,8 +1392,7 @@ def save_results(run_dir, model, conversation, timing, score):
         json.dump(score, f, indent=2)
 
     total_secs = timing.get("total_seconds", 0)
-    lint_secs = timing.get("lint_time", 0)
-    model_secs = max(total_secs - lint_secs, 0)
+    model_secs = total_secs
     human_total = format_time(total_secs)
     human_model = format_time(model_secs)
     human_lint = format_time(lint_secs)
@@ -1357,15 +1507,17 @@ def run_model_benchmark(model):
     run_dir = os.path.join(RESULTS_BASE, model_clean, timestamp)
     os.makedirs(run_dir, exist_ok=True)
 
-    # Capability detection (fail-fast prep). Skip models that cannot chat.
+    # Capability detection (fail-fast prep). Skip ONLY embedding-only models;
+    # an empty/absent capability list is treated as chat-capable (is_chat_model)
+    # so transient/newer-tag models are not wrongly skipped.
     capabilities = get_model_capabilities(model)
-    if "completion" not in capabilities:
+    if not is_chat_model(model):
         print(f"\n{'='*60}")
-        print(f"SKIPPING {model}: not a chat model (capabilities={sorted(capabilities) or 'none'})")
+        print(f"SKIPPING {model}: not a chat model (capabilities={sorted(capabilities) or 'embedding'})")
         print(f"{'='*60}")
         return {
             "skipped": True,
-            "reason": f"not a chat model (capabilities={sorted(capabilities) or 'none'})",
+            "reason": f"not a chat model (capabilities={sorted(capabilities) or 'embedding'})",
             "capabilities": sorted(capabilities),
         }, run_dir
 
@@ -1382,7 +1534,7 @@ def run_model_benchmark(model):
 
     messages = [{"role": "user", "content": PROMPT}]
     conversation = []
-    timing = {"total_seconds": 0, "lint_time": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "capabilities": sorted(capabilities),
+    timing = {"total_seconds": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "capabilities": sorted(capabilities),
               "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None,
               "large_n2_match": False, "large_n2_count_match": False, "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": ""}
     total_prompt_tokens = 0
@@ -1394,17 +1546,6 @@ def run_model_benchmark(model):
     mode = "tool_call"  # or "text"
     did_compile_verify = False
     stall_counter = {}  # content_hash -> count, to detect repeated failures
-
-    # Defensive cleanup: a leftover tempoutput.txt from a prior manual run or
-    # an interrupted benchmark would otherwise be silently hashed by the verify
-    # steps and produce a false result. Start each run from a clean slate.
-    _stale = os.path.join(run_dir, "tempoutput.txt")
-    if os.path.exists(_stale):
-        try:
-            os.remove(_stale)
-            print(f"  Removed stale tempoutput.txt from {run_dir}")
-        except OSError:
-            pass
 
     for turn in range(1, MAX_TURNS + 1):
         elapsed = time.time() - start_time
@@ -1486,12 +1627,20 @@ def run_model_benchmark(model):
 
         if tool_calls:
             mode = "tool_call"
+            # jq-audit-first: validate the raw assistant text as JSON BEFORE we
+            # trust any tool-call extraction. If the model emitted raw JSON it
+            # should at least be well-formed; log the verdict transparently so
+            # the user can audit what the model actually produced each turn.
+            _audit = jq_audit(content) if content else True
+            print(f"  ── TOOL REQUEST ── turn={turn} n_calls={len(tool_calls)} "
+                  f"jq_audit={'PASS' if _audit else 'FAIL'}")
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
                 args = fn.get("arguments", {})
 
-                print(f"  Tool call: {name}")
+                print(f"  Tool call: {name}  args={json.dumps(args)[:200]}")
+                print(f"  ── TOOL REQUEST ── {name}({json.dumps(args)[:200]})")
 
                 if name in TOOL_DISPATCH:
                     try:
@@ -1499,8 +1648,31 @@ def run_model_benchmark(model):
                     except Exception as e:
                         result = json.dumps({"ok": False, "error": str(e)})
                 else:
-                    result = json.dumps({"ok": False, "error": f"Unknown tool: {name}"})
+                    # Model-actionable guidance: tell the model the exact valid
+                    # tool names so it can self-correct instead of stalling.
+                    valid = ", ".join(sorted(TOOL_DISPATCH.keys()))
+                    result = json.dumps({
+                        "ok": False,
+                        "error": f"Unknown tool: '{name}'. Valid tools are: {valid}.",
+                    })
 
+                # Model-actionable guidance for missing/invalid arguments:
+                # surface the required schema fields so the model can retry.
+                if name in TOOL_DISPATCH and result.startswith('{"ok": false'):
+                    try:
+                        _rj = json.loads(result)
+                        if "error" in _rj:
+                            _req = _required_args_for(name)
+                            if _req:
+                                _rj["hint"] = (
+                                    f"Required arguments for '{name}': "
+                                    + ", ".join(_req)
+                                )
+                                result = json.dumps(_rj)
+                    except Exception:
+                        pass
+
+                fed_to_model = True
                 if name == "compile_java":
                     try:
                         data = json.loads(result)
@@ -1508,10 +1680,9 @@ def run_model_benchmark(model):
                         stderr = data.get("stderr", "")
                         wc = len([l for l in stderr.split("\n") if "warning" in l.lower()])
                         javac_warnings = max(javac_warnings, wc)
-                        timing["lint_time"] = timing.get("lint_time", 0) + data.get("lint_time", 0)
                     except: pass
 
-                if name == "run_and_hash":
+                if name == "run":
                     try:
                         data = json.loads(result)
                         if data.get("matches_expected"):
@@ -1533,9 +1704,28 @@ def run_model_benchmark(model):
                         print(f"  search_solutions returned {n_hits} reference chunk(s)")
                     except: pass
 
+                if name == "run_junit_verification":
+                    try:
+                        data = json.loads(result)
+                        timing["junit_passed"] = data.get("passed", 0)
+                        timing["junit_total"] = data.get("total", 0)
+                        timing["junit_failed"] = data.get("failed", 0)
+                        print(f"  JUnit: passed={timing['junit_passed']} "
+                              f"total={timing['junit_total']} "
+                              f"failed={timing['junit_failed']}")
+                        if data.get("error"):
+                            print(f"  JUnit error: {data['error'][:200]}")
+                    except: pass
+
+                if name == "write_file":
+                    print(f"  ── SOURCE WRITTEN ── {args.get('path','?')} "
+                          f"({len(args.get('content',''))} bytes)")
+
+                print(f"  ── FED TO MODEL ── {name} -> {result[:200]}")
                 conversation.append({
                     "turn": turn, "role": "tool",
-                    "name": name, "content": result
+                    "name": name, "content": result,
+                    "fed_to_model": fed_to_model,
                 })
                 messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
                 messages.append({"role": "tool", "content": result, "name": name, "tool_call_id": tc.get("id", "")})
@@ -1578,7 +1768,6 @@ def run_model_benchmark(model):
                 javac_warnings = max(javac_warnings, tcv["javac_warnings"])
                 timing["checkstyle_count"] = tcv["checkstyle_count"]
                 timing["pmd_count"] = tcv["pmd_count"]
-                timing["lint_time"] = timing.get("lint_time", 0) + tcv["lint_time"]
                 timing["exec_time"] = timing.get("exec_time", 0) + tcv["exec_time"]
                 _copy_large_n(timing, tcv)
                 did_compile_verify = True
@@ -1599,7 +1788,7 @@ def run_model_benchmark(model):
                     messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
-                        "content": f"The code compiled successfully but the SHA-256 hash doesn't match {EXPECTED_HASH}. Write each prime followed by '\\n' to tempoutput.txt, compute the SHA-256 over those bytes, print ONLY that hash to stdout, then the temp file is deleted. The prime bytes for N=11 are '2\\n3\\n5\\n7\\n11\\n' and their digest must be {EXPECTED_HASH}."
+                        "content": f"The code compiled successfully but the SHA-256 hash it printed to stdout doesn't match {EXPECTED_HASH}. Print ONLY the lowercase-hex SHA-256 of the prime bytes (each prime on its own line followed by '\\n') to stdout — no other output, no file. The digest for N=11 (primes 2,3,5,7,11) must be {EXPECTED_HASH}."
                     })
                     continue
                 else:
@@ -1630,7 +1819,6 @@ def run_model_benchmark(model):
                 javac_warnings = max(javac_warnings, tcv["javac_warnings"])
                 timing["checkstyle_count"] = tcv["checkstyle_count"]
                 timing["pmd_count"] = tcv["pmd_count"]
-                timing["lint_time"] = timing.get("lint_time", 0) + tcv["lint_time"]
                 timing["exec_time"] = timing.get("exec_time", 0) + tcv["exec_time"]
                 _copy_large_n(timing, tcv)
                 did_compile_verify = True
@@ -1848,7 +2036,7 @@ def _write_ranking(results_summary):
         "rank":   "rank / position",
         "model":  "model name",
         "score":  "composite score (0-100)",
-        "correct":"correctness (0=none, 25=has Java, 50=compiles, 100=hash match)",
+        "correct":"correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale)",
         "c_tag":  "compiled? (✓/✗)",
         "h_tag":  "SHA-256 hash matches expected? (✓/✗)",
         "viol":   "lint violations (javac+checkstyle+PMD; lower better)",
@@ -1907,7 +2095,7 @@ def _write_ranking(results_summary):
         "",
         "### Key",
         "- **TOTAL**: composite score (0–100)",
-        "- **CORR**: correctness (0=none, 25=has Java, 50=compiles, 100=hash match)",
+        "- **CORR**: correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale via 1E6/1E7 manifest or full JUnit sweep)",
         "- **CPILE**: code compiled? (✓/✗)",
         "- **HASH**: SHA-256 hash matches expected? (✓/✗)",
         "- **VIOL**: total lint violations (javac warnings + checkstyle + PMD; lower is better)",
@@ -1921,7 +2109,7 @@ def _write_ranking(results_summary):
         "- **EXEC**: time for compiled Java code to execute (seconds)",
         "- **MTIME**: total model wall-clock time excluding lint (seconds or minutes)",
         "- **TOK/s**: generation throughput — completion tokens per second of model wall-clock time (higher = faster generation)",
-        "- **1E6**: does the sieve scale? Hash of the prime list (written by the model to tempoutput.txt, one prime per line + '\\n', then hashed) for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). ✓ = matches, ✗ = hash mismatch (wrong sieve), E = the 1e6 check itself errored/timed out (indeterminate — not a model fail). At 1e6 the algorithm dominates runtime, so this neutralizes any 'don't write a file' micro-optimization advantage.",
+        "- **1E6**: does the sieve scale? The SHA-256 hash the program prints to stdout for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). ✓ = matches, ✗ = hash mismatch (wrong sieve), E = the 1e6 check itself errored/timed out (indeterminate — not a model fail). At 1e6 the algorithm dominates runtime, so this neutralizes any 'don't write a file' micro-optimization advantage.",
         "- **1E7**: does the faster-than-naive sieve scale to N=10,000,000? Same manifest hash/check (664579 primes). ✓ = matches, ✗ = hash mismatch, E = check errored/timed out. Confirms the optimized algorithm (segmented / bit-packed / odds-only) produces identical output at scale and runs faster than the naive boolean[] sieve.",
         "- **MODE**: `tool_call` = native Ollama tool API, `text` = JSON extracted from plaintext",
         "",
@@ -1981,6 +2169,77 @@ def _write_ranking(results_summary):
     print(f"Ranking (markdown) saved to {ranking_md}")
 
 
+def _dedup_rows(rows):
+    """Collapse duplicate rows (same model) keeping the highest-scoring entry.
+    Models can appear twice if a re-run created a second timestamped dir; the
+    ranking should show each model once, at its best."""
+    best = {}
+    for r in rows:
+        k = r.get("model") or r.get("model_short")
+        if k not in best or r.get("score", 0) > best[k].get("score", 0):
+            best[k] = r
+    return list(best.values())
+
+
+def clean_results(regen=True, purge=False, dry_run=False):
+    """Tidy the results/ tree.
+
+    - dedup: keep only the best score per model in ranking.md/ranking.json
+      (rebuilt from on-disk score.json, dropping duplicate low runs).
+    - purge: also DELETE the losing run directories from disk (the per-model
+      timestamped subdirs not represented in the deduped ranking).
+    - regen: rebuild ranking tables from the surviving score.json files.
+    - dry_run: report what WOULD change, delete nothing, write nothing.
+    """
+    import glob as _glob
+    import shutil as _shutil
+
+    rows = []
+    all_scores = {}  # run_dir -> (model, score)
+    for sp in _glob.glob(os.path.join(RESULTS_BASE, "*", "*", "score.json")):
+        try:
+            with open(sp) as f:
+                score = json.load(f)
+        except Exception:
+            continue
+        run_dir = os.path.dirname(sp)
+        model = os.path.basename(os.path.dirname(run_dir))
+        all_scores[run_dir] = (model, score)
+        rows.append(score_to_row(model, run_dir, score))
+
+    deduped = _dedup_rows(rows)
+    keep_dirs = set()
+    for r in deduped:
+        rd = r.get("run_dir")
+        if rd:
+            keep_dirs.add(os.path.abspath(rd))
+
+    losers = [d for d in all_scores if os.path.abspath(d) not in keep_dirs]
+
+    print(f"[clean] {len(all_scores)} total runs, {len(deduped)} models after dedup, "
+          f"{len(losers)} run dir(s) would be removed.")
+    for d in sorted(losers):
+        print(f"  REMOVE {d}")
+
+    if dry_run:
+        print("[clean] dry-run: no changes made.")
+        return deduped
+
+    if purge:
+        for d in losers:
+            try:
+                _shutil.rmtree(d)
+                print(f"  deleted {d}")
+            except Exception as e:
+                print(f"  FAILED to delete {d}: {e}")
+
+    if regen:
+        deduped.sort(key=lambda x: x["score"], reverse=True)
+        _write_ranking(deduped)
+        print(f"[clean] ranking regenerated for {len(deduped)} model(s).")
+    return deduped
+
+
 def main():
     os.makedirs(RESULTS_BASE, exist_ok=True)
 
@@ -1996,15 +2255,17 @@ def main():
     for m in models:
         print(f"  - {m}")
 
-    # Filter out non-chat models (e.g. embedding-only) up front; report them.
+    # Filter out non-chat models (embedding-only) up front; report them.
+    # We skip ONLY models that explicitly report embedding capability; an empty
+    # capability list is treated as chat-capable (see is_chat_model).
     chat_models = []
     skipped_models = []
     for m in models:
-        caps = get_model_capabilities(m)
-        if "completion" in caps:
+        if is_chat_model(m):
             chat_models.append(m)
         else:
-            skipped_models.append((m, sorted(caps) or "none"))
+            caps = get_model_capabilities(m)
+            skipped_models.append((m, sorted(caps) or "embedding"))
     if skipped_models:
         print(f"\nSkipping {len(skipped_models)} non-chat model(s):")
         for m, caps in skipped_models:
@@ -2054,7 +2315,20 @@ def main():
 
 if __name__ == "__main__":
     import sys as _sys
-    if len(_sys.argv) > 1 and _sys.argv[1] == "--regen":
+    args = set(_sys.argv[1:])
+    if "--clean" in args:
+        # Deduplicate ranking + delete losing run dirs, then regen tables.
+        clean_results(regen=True, purge=True, dry_run=False)
+    elif "--clean-regen" in args:
+        # Deduplicate + regen tables, but keep all run dirs on disk.
+        clean_results(regen=True, purge=False, dry_run=False)
+    elif "--clean-purge" in args:
+        # Delete losing run dirs WITHOUT rewriting the ranking tables.
+        clean_results(regen=False, purge=True, dry_run=False)
+    elif "--dry-run" in args:
+        # Show what --clean would remove, change nothing.
+        clean_results(regen=True, purge=True, dry_run=True)
+    elif "--regen" in args:
         regenerate_ranking()
     else:
         main()

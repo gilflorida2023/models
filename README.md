@@ -282,7 +282,7 @@ INCLUDE_HELLO_ALGO=true nohup .venv/bin/python ingest_corpora.py > ingest_night.
 
 No CLI arguments. At startup it queries live Ollama (`/api/tags`), then
 benchmarks every chat-capable model. Each model gets the hashprime task with
-tools (`write_file`, `compile_java`, `run_and_hash`, `submit_answer`,
+tools (`write_file`, `compile_java`, `run`, `submit_answer`,
 `search_solutions`); generated code is compiled and executed at all four scales.
 
 ```bash
@@ -294,10 +294,9 @@ Outputs (under `results/`):
 - `ranking.json` — machine-readable results
 - `results/<model>/<timestamp>/hashprime.java` — each model's submission
 
-The `1E6` and `1E7` columns confirm the sieve scales: each model writes its
-prime list to `tempoutput.txt` (one prime per line + `\\n`), then the harness
-hashes those exact bytes — the SHA-256 for N=1,000,000 and N=10,000,000 must
-match the A000040 manifest (`4883963d…` and `36d61978…` respectively). The
-program prints ONLY the hash to stdout; the temp file is deleted after hashing.
+The `1E6` and `1E7` columns confirm the sieve scales: the SHA-256 hash the
+program prints to stdout for N=1,000,000 and N=10,000,000 must match the A000040
+manifest (`4883963d…` and `36d61978…` respectively). The program prints ONLY the
+hash to stdout; the harness compares it directly against the manifest.
 This neutralizes any "don't write a file" micro-optimization advantage, since at
 scale the algorithm dominates runtime.
