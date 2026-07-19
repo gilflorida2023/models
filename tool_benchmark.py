@@ -132,6 +132,11 @@ Tool: write_file
   Arguments: path (string), content (string)
   Example: {"name": "write_file", "arguments": {"path": "hashprime.java", "content": "public class hashprime { ... }"}}
 
+Tool: read_file
+  Description: Read the full contents of a file in the working directory and return them as text. Use it to inspect source you wrote with write_file (e.g. hashprime.java), to re-read a file before editing it, or to confirm what a prior step produced. Returns {ok:true, path, content, size} on success, or {ok:false, error:"file not found"} if the path does not exist. Paths are relative to the working directory.
+  Arguments: path (string) - file to read, relative to the working directory
+  Example: {"name": "read_file", "arguments": {"path": "hashprime.java"}}
+
 Tool: compile_java
   Description: Compile hashprime.java with javac
   Arguments: none
@@ -673,6 +678,28 @@ TOOL_SCHEMA = [
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read the full contents of a file in the working directory and "
+                "return them as text. Use it to inspect source you previously "
+                "wrote with write_file (e.g. hashprime.java), or to re-read a "
+                "file before editing it, or to confirm what a prior step produced. "
+                "Returns {ok:true, path, content, size} on success, or "
+                "{ok:false, error:'file not found'} if the path does not exist. "
+                "Paths are relative to the working directory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path of the file to read, relative to the working directory (e.g. 'hashprime.java')."},
+                },
+                "required": ["path"],
             },
         },
     },
