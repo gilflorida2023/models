@@ -1436,10 +1436,10 @@ def save_results(run_dir, model, conversation, timing, score):
     pmd_count = score["details"].get("pmd_count", 0)
     mode = score["details"].get("mode", "?")
     jq_passed = score["details"].get("jq_audit_passed", True)
-    jq_str = "✓ jq" if jq_passed else "✗ jq FAIL"
+    jq_str = "PASS jq" if jq_passed else "FAIL jq"
     sem_passed = score["details"].get("semantic_passed", True)
     sem_score = score["details"].get("semantic_score", 0.0)
-    sem_str = f"✓ sem ({sem_score:.2f})" if sem_passed else f"✗ sem FAIL ({sem_score:.2f})"
+    sem_str = f"PASS sem ({sem_score:.2f})" if sem_passed else f"FAIL sem ({sem_score:.2f})"
 
     lint_str = f"{javac_warnings} javac + {checkstyle_count} checkstyle + {pmd_count} PMD"
     if javac_warnings == 0 and checkstyle_count == 0 and pmd_count == 0:
@@ -1459,7 +1459,7 @@ def save_results(run_dir, model, conversation, timing, score):
 
     summary = f"""Model: {model}
 ─────────────────────────────────────────────────
-Result:   {'✓ PASS' if score['correctness'] >= 100 else '✗ FAIL'}
+Result:   {'PASS' if score['correctness'] >= 100 else 'FAIL'}
 Time:     {human_model} model = {human_total} wall  (score: {score['speed_score']}/100)
 Correct:  {'Yes - hash matches expected' if score['correctness'] >= 100 else 'No - wrong hash'}
 Compiled: {'Yes' if score['details'].get('compile_ok') else 'No'}
@@ -1974,23 +1974,23 @@ def score_to_row(model, run_dir, score):
     """Convert a finished score dict into a ranking summary row."""
     sem_passed = score["details"].get("semantic_passed", True)
     sem_score = score["details"].get("semantic_score", 0.0)
-    sem_tag = "✓" if sem_passed else "✗"
+    sem_tag = "PASS" if sem_passed else "FAIL"
     tools_used_list = score["details"].get("tools_used", [])
     has_write_file = "write_file" in tools_used_list
     jq_passed = score["details"].get("jq_audit_passed", True)
-    tool_ok = "✓" if (score["details"].get("mode") == "tool_call" or (has_write_file and jq_passed)) else "✗"
+    tool_ok = "PASS" if (score["details"].get("mode") == "tool_call" or (has_write_file and jq_passed)) else "FAIL"
     compile_ok = score["details"].get("compile_ok", False)
     hash_match = score["details"].get("hash_match", False)
     thinking_support = score["details"].get("thinking_support", False)
-    think_tag = "✓" if thinking_support else "✗"
+    think_tag = "PASS" if thinking_support else "FAIL"
     used_retrieval = score["details"].get("used_retrieval", False)
-    retr_tag = "✓" if used_retrieval else "✗"
+    retr_tag = "PASS" if used_retrieval else "FAIL"
     large_n_match = score["details"].get("large_n_match", False)
     large_n_err = score["details"].get("large_n_error", "")
-    large_n_tag = "✓" if large_n_match else ("E" if large_n_err else "✗")
+    large_n_tag = "PASS" if large_n_match else ("ERR" if large_n_err else "FAIL")
     large_n2_match = score["details"].get("large_n2_match", False)
     large_n2_err = score["details"].get("large_n2_error", "")
-    large_n2_tag = "✓" if large_n2_match else ("E" if large_n2_err else "✗")
+    large_n2_tag = "PASS" if large_n2_match else ("ERR" if large_n2_err else "FAIL")
     total_violations = (
         score["details"].get("javac_warnings", 0) +
         score["details"].get("checkstyle_count", 0) +
@@ -2083,7 +2083,7 @@ def _write_ranking(results_summary):
         ("c_tag",   "CPILE", 5,   "CPILE"),
         ("h_tag",   "HASH",  5,   "HASH"),
         ("viol",    "VIOL",  4,   "VIOL"),
-        ("sem",     "SEM",   3,   "SEM"),
+        ("sem",     "SEM",   4,   "SEM"),
         ("tool",    "TOOL",  4,   "TOOL"),
         ("think",   "THINK", 5,   "THINK"),
         ("retr",    "RETR",  5,   "RETR"),
@@ -2099,8 +2099,8 @@ def _write_ranking(results_summary):
     ]
 
     def row_values(i, r):
-        c_tag = "✓" if r["compile_ok"] else "✗"
-        h_tag = "✓" if r["hash_match"] else "✗"
+        c_tag = "PASS" if r["compile_ok"] else "FAIL"
+        h_tag = "PASS" if r["hash_match"] else "FAIL"
         drift = r["thinking_drift"]
         drift_s = f"{drift:+.2f}" if isinstance(drift, (int, float)) else "-"
         return {
@@ -2132,21 +2132,21 @@ def _write_ranking(results_summary):
         "model":  "model name",
         "score":  "composite score (0-100)",
         "correct":"correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale)",
-        "c_tag":  "compiled? (✓/✗)",
-        "h_tag":  "SHA-256 hash matches expected? (✓/✗)",
+        "c_tag":  "compiled? (PASS/FAIL)",
+        "h_tag":  "SHA-256 hash matches expected? (PASS/FAIL)",
         "viol":   "lint violations (javac+checkstyle+PMD; lower better)",
-        "sem":    "semantic gate pass? (✓/✗)",
-        "tool":   "tool-call support? (✓/✗)",
-        "think":  "thinking/reasoning trace present? (✓/✗)",
-        "retr":   "used search_solutions retrieval? (✓/✗)",
+        "sem":    "semantic gate pass? (PASS/FAIL)",
+        "tool":   "tool-call support? (PASS/FAIL)",
+        "think":  "thinking/reasoning trace present? (PASS/FAIL)",
+        "retr":   "used search_solutions retrieval? (PASS/FAIL)",
         "ts":     "thinking quality (0-100, vs hashprime_solutions)",
         "drift":  "TSCORE − prompt baseline (positive=more on-topic)",
         "iter":   "conversation turns used",
         "exec":   "compiled Java execution time",
         "time":   "model wall-clock time (excl. lint)",
         "tok_s":  "generation throughput (tokens/sec)",
-        "large":  "1E6 sieve hash == manifest? (✓/✗/E)",
-        "large2": "1E7 sieve hash == manifest? (✓/✗/E)",
+        "large":  "1E6 sieve hash == manifest? (PASS/FAIL/ERR)",
+        "large2": "1E7 sieve hash == manifest? (PASS/FAIL/ERR)",
         "mode":   "tool_call = native API, text = JSON-in-plaintext",
     }
 
@@ -2155,7 +2155,7 @@ def _write_ranking(results_summary):
     console_header = "  " + "  ".join(f"{h:<{w}}" for _, h, w, _ in COLS)
     print(console_header)
     print(f"  {'─'*len(console_header)}")
-    print(f"  (higher=better: TOTAL/CORR/TSCORE; lower=better: VIOL; ✓/✗=pass/fail; ITER=turns; EXEC=code run; MTIME=model wall-clock)")
+    print(f"  (higher=better: TOTAL/CORR/TSCORE; lower=better: VIOL; PASS/FAIL=pass/fail; ITER=turns; EXEC=code run; MTIME=model wall-clock)")
     print(f"{'─'*150}")
     for i, r in enumerate(results_summary, 1):
         v = row_values(i, r)
@@ -2191,21 +2191,21 @@ def _write_ranking(results_summary):
         "### Key",
         "- **TOTAL**: composite score (0–100)",
         "- **CORR**: correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale via 1E6/1E7 manifest or full JUnit sweep)",
-        "- **CPILE**: code compiled? (✓/✗)",
-        "- **HASH**: SHA-256 hash matches expected? (✓/✗)",
+        "- **CPILE**: code compiled? (PASS/FAIL)",
+        "- **HASH**: SHA-256 hash matches expected? (PASS/FAIL)",
         "- **VIOL**: total lint violations (javac warnings + checkstyle + PMD; lower is better)",
-        "- **SEM**: semantic gate pass? (✓ = output is on-topic for the hashprime problem)",
-        "- **TOOL**: tool call support? (✓ = native API or text-mode with valid JSON + file write)",
-        "- **THINK**: thinking/reasoning trace present? (✓ = Ollama returned a non-empty `thinking` field when `think:true` requested)",
-        "- **RETR**: did the model use the `search_solutions` retrieval tool? (✓ = yes)",
+        "- **SEM**: semantic gate pass? (PASS = output is on-topic for the hashprime problem)",
+        "- **TOOL**: tool call support? (PASS = native API or text-mode with valid JSON + file write)",
+        "- **THINK**: thinking/reasoning trace present? (PASS = Ollama returned a non-empty `thinking` field when `think:true` requested)",
+        "- **RETR**: did the model use the `search_solutions` retrieval tool? (PASS = yes)",
         "- **TSCORE**: semantic quality of the thinking trace (0–100). Chonkie chunks the trace, embeds via Ollama nomic-embed-text, mean cosine similarity vs hashprime_solutions in Qdrant. Higher = reasoning more aligned with known-good solutions.",
         "- **DRIFT**: TSCORE − PROMPT_TS (prompt baseline alignment). Positive = model reasoning is more on-topic than the prompt itself.",
         "- **ITER**: number of conversation turns the model took",
         "- **EXEC**: time for compiled Java code to execute (seconds)",
         "- **MTIME**: total model wall-clock time excluding lint (seconds or minutes)",
         "- **TOK/s**: generation throughput — completion tokens per second of model wall-clock time (higher = faster generation)",
-        "- **1E6**: does the sieve scale? The SHA-256 hash the program prints to stdout for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). ✓ = matches, ✗ = hash mismatch (wrong sieve), E = the 1e6 check itself errored/timed out (indeterminate — not a model fail). At 1e6 the algorithm dominates runtime, so this neutralizes any 'don't write a file' micro-optimization advantage.",
-        "- **1E7**: does the faster-than-naive sieve scale to N=10,000,000? Same manifest hash/check (664579 primes). ✓ = matches, ✗ = hash mismatch, E = check errored/timed out. Confirms the optimized algorithm (segmented / bit-packed / odds-only) produces identical output at scale and runs faster than the naive boolean[] sieve.",
+        "- **1E6**: does the sieve scale? The SHA-256 hash the program prints to stdout for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). PASS = matches, FAIL = hash mismatch (wrong sieve), ERR = the 1e6 check itself errored/timed out (indeterminate — not a model fail). At 1e6 the algorithm dominates runtime, so this neutralizes any 'don't write a file' micro-optimization advantage.",
+        "- **1E7**: does the faster-than-naive sieve scale to N=10,000,000? Same manifest hash/check (664579 primes). PASS = matches, FAIL = hash mismatch, ERR = check errored/timed out. Confirms the optimized algorithm (segmented / bit-packed / odds-only) produces identical output at scale and runs faster than the naive boolean[] sieve.",
         "- **MODE**: `tool_call` = native Ollama tool API, `text` = JSON extracted from plaintext",
         "",
     ])
@@ -2218,25 +2218,25 @@ def _write_ranking(results_summary):
     md_lines.extend(best_names)
     md_lines.append("")
 
-    best_semantic = [r for r in results_summary if r["sem_tag"] == "✓"]
+    best_semantic = [r for r in results_summary if r["sem_tag"] == "PASS"]
     if best_semantic:
         md_lines.append("### Semantic Gate Passed\n")
         for r in best_semantic:
             md_lines.append(f"  - **{r['model']}** — score {r['score']} | sem {r['sem_score']:.2f}")
         md_lines.append("")
 
-    best_tool = [r for r in results_summary if r["tool_ok"] == "✓"]
+    best_tool = [r for r in results_summary if r["tool_ok"] == "PASS"]
     if best_tool:
         md_lines.append("### Tool Call Support\n")
         for r in best_tool:
             md_lines.append(f"  - **{r['model']}** — mode {r['mode']} | TOTAL {r['score']}")
         md_lines.append("")
 
-    no_tool = [r for r in results_summary if r["tool_ok"] == "✗"]
+    no_tool = [r for r in results_summary if r["tool_ok"] == "FAIL"]
     if no_tool:
         md_lines.append("### No Tool Call Support\n")
         for r in no_tool:
-            md_lines.append(f"  - **{r['model']}** — mode {r['mode']} | jq {'✓' if r['jq_passed'] else '✗'} | write_file {'✓' if r['has_write_file'] else '✗'}")
+            md_lines.append(f"  - **{r['model']}** — mode {r['mode']} | jq {'PASS' if r['jq_passed'] else 'FAIL'} | write_file {'PASS' if r['has_write_file'] else 'FAIL'}")
         md_lines.append("")
 
     # Thinking quality ranking (only models that emitted a thinking trace)
@@ -2383,11 +2383,11 @@ def main():
                 "turns_used": 0, "exec_time_secs": 0, "exec_str": "-",
                 "model_time_secs": 0, "time_str": "-", "gen_tok_s": 0.0,
                 "tools_used": "", "mode": "?", "javac_w": 0, "cs": 0, "pmd": 0,
-                "sem_tag": "✗", "sem_score": 0.0, "tool_ok": "✗", "think_tag": "✗",
+                "sem_tag": "FAIL", "sem_score": 0.0, "tool_ok": "FAIL", "think_tag": "FAIL",
                 "thinking_support": False, "think_score": 0, "thinking_quality_chunks": 0,
                 "thinking_quality_mean_sim": 0.0, "thinking_quality_error": str(e)[:200],
-                "prompt_ts": 0.0, "thinking_drift": None, "retr_tag": "✗",
-                "large_n_tag": "✗", "large_n2_tag": "✗", "used_retrieval": False,
+                "prompt_ts": 0.0, "thinking_drift": None, "retr_tag": "FAIL",
+                "large_n_tag": "FAIL", "large_n2_tag": "FAIL", "used_retrieval": False,
                 "jq_passed": False, "has_write_file": False, "run_dir": "",
             })
             continue
