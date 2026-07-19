@@ -899,6 +899,37 @@ def jq_audit(text):
         return False
 
 
+def _pretty_json(obj, max_chars=200000):
+    """Pretty-print anything as indented JSON for the log. Falls back to a
+    UTF-8-safe, head+tail-truncated repr if the value isn't JSON-serializable
+    or is pathologically large — so logging never raises and never floods."""
+    try:
+        text = json.dumps(obj, indent=2)
+    except Exception:
+        text = repr(obj)
+    # Sanitize to valid UTF-8 first so binary/garbage can't corrupt the stream.
+    text = text.encode("utf-8", "replace").decode("utf-8")
+    if len(text) > max_chars:
+        head = text[: max_chars // 2]
+        tail = text[-max_chars // 2 :]
+        text = f"{head}\n… (+{len(text) - max_chars} more chars truncated) …\n{tail}"
+    return text
+
+
+def _safe_log(text, limit=2000):
+    """Return a log-safe version of arbitrary text: valid UTF-8, head+tail
+    truncated at `limit` chars, wrapped so callers can never raise on logging.
+    Use this for malformed/oversized tool calls / raw model output so a bad
+    payload is recorded but can never kill or corrupt the log stream."""
+    try:
+        s = str(text).encode("utf-8", "replace").decode("utf-8")
+    except Exception:
+        s = "<unloggable content>"
+    if len(s) > limit:
+        s = s[: limit // 2] + f"\n… (+{len(s) - limit} more chars truncated) …\n" + s[-limit // 2 :]
+    return s
+
+
 # === Semantic gate (on-topic detection via embedding + Qdrant) ===
 
 QDRANT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qdrant_data")
@@ -1395,7 +1426,8 @@ def save_results(run_dir, model, conversation, timing, score):
     model_secs = total_secs
     human_total = format_time(total_secs)
     human_model = format_time(model_secs)
-    human_lint = format_time(lint_secs)
+    # Lint is user-only and not separately timed; keep the line honest.
+    human_lint = format_time(0)
     prompt_tokens = timing.get("prompt_tokens", 0)
     completion_tokens = timing.get("completion_tokens", 0)
     tools_used = ", ".join(score["details"].get("tools_used", ["(none)"]))
@@ -1428,7 +1460,7 @@ def save_results(run_dir, model, conversation, timing, score):
     summary = f"""Model: {model}
 ─────────────────────────────────────────────────
 Result:   {'✓ PASS' if score['correctness'] >= 100 else '✗ FAIL'}
-Time:     {human_model} model + {human_lint} lint = {human_total} wall  (score: {score['speed_score']}/100)
+Time:     {human_model} model = {human_total} wall  (score: {score['speed_score']}/100)
 Correct:  {'Yes - hash matches expected' if score['correctness'] >= 100 else 'No - wrong hash'}
 Compiled: {'Yes' if score['details'].get('compile_ok') else 'No'}
 Large-N (1e6):  {'Yes - hash matches A000040 manifest' if score['details'].get('large_n_match') else ('ERR - check failed: ' + str(score['details'].get('large_n_error', ''))[:60] if score['details'].get('large_n_error') else 'No - 1e6 hash mismatch')} ({score['details'].get('large_n_exec_time', 0):.2f}s)
@@ -1613,7 +1645,7 @@ def run_model_benchmark(model):
             # with a header so the failure is obvious).
             with open(os.path.join(run_dir, "failed_streams.log"), "a") as _fs:
                 _fs.write(f"\n=== Turn {turn} — jq audit FAILED (raw output is not valid JSON) ===\n")
-                _fs.write(content + "\n")
+                _fs.write(_safe_log(content, limit=200000) + "\n")
             # Record the failure in the persisted conversation transcript so it
             # is visible in conversation.json (not just in failed_streams.log).
             conversation.append({
@@ -1666,8 +1698,12 @@ def run_model_benchmark(model):
                 name = fn.get("name", "")
                 args = fn.get("arguments", {})
 
-                print(f"  Tool call: {name}  args={json.dumps(args)[:200]}")
-                print(f"  ── TOOL REQUEST ── {name}({json.dumps(args)[:200]})")
+                # ── TOOL REQUEST (sent): pretty-print the call + args ──
+                print(f"  ── TOOL REQUEST ── {name}")
+                try:
+                    print(_pretty_json(args))
+                except Exception:
+                    print(_safe_log(args))
 
                 if name in TOOL_DISPATCH:
                     try:
@@ -1678,6 +1714,10 @@ def run_model_benchmark(model):
                     # Model-actionable guidance: tell the model the exact valid
                     # tool names so it can self-correct instead of stalling.
                     valid = ", ".join(sorted(TOOL_DISPATCH.keys()))
+                    # Log the bad call safely (truncated/sanitized) so it can't
+                    # kill or corrupt the log stream.
+                    print(f"  ── BAD TOOL CALL (safe-logged) ── name={_safe_log(name)} "
+                          f"args={_safe_log(args)}")
                     result = json.dumps({
                         "ok": False,
                         "error": f"Unknown tool: '{name}'. Valid tools are: {valid}.",
@@ -1685,19 +1725,24 @@ def run_model_benchmark(model):
 
                 # Model-actionable guidance for missing/invalid arguments:
                 # surface the required schema fields so the model can retry.
-                if name in TOOL_DISPATCH and result.startswith('{"ok": false'):
-                    try:
-                        _rj = json.loads(result)
-                        if "error" in _rj:
-                            _req = _required_args_for(name)
-                            if _req:
-                                _rj["hint"] = (
-                                    f"Required arguments for '{name}': "
-                                    + ", ".join(_req)
-                                )
-                                result = json.dumps(_rj)
-                    except Exception:
-                        pass
+                # Guard the result parse so a malformed (non-JSON) result is
+                # logged safely instead of crashing the harness.
+                try:
+                    _rj = json.loads(result)
+                    _malformed = False
+                except Exception:
+                    _rj = None
+                    _malformed = True
+                if _malformed:
+                    print(f"  ── MALFORMED TOOL RESULT (safe-logged) ── {_safe_log(result)}")
+                elif name in TOOL_DISPATCH and _rj.get("ok") is False and "error" in _rj:
+                    _req = _required_args_for(name)
+                    if _req:
+                        _rj["hint"] = (
+                            f"Required arguments for '{name}': "
+                            + ", ".join(_req)
+                        )
+                        result = json.dumps(_rj)
 
                 fed_to_model = True
                 if name == "compile_java":
@@ -1741,14 +1786,37 @@ def run_model_benchmark(model):
                               f"total={timing['junit_total']} "
                               f"failed={timing['junit_failed']}")
                         if data.get("error"):
-                            print(f"  JUnit error: {data['error'][:200]}")
+                            print(f"  JUnit error: {_safe_log(data['error'])}")
                     except: pass
 
                 if name == "write_file":
-                    print(f"  ── SOURCE WRITTEN ── {args.get('path','?')} "
-                          f"({len(args.get('content',''))} bytes)")
+                    # Pretty-print the file the model wrote (full source).
+                    _p = args.get("path", "?")
+                    _c = args.get("content", "")
+                    print(f"  ── SOURCE WRITTEN ── {_p} ({len(_c)} bytes)")
+                    print(_pretty_json({"path": _p, "content": _c}))
 
-                print(f"  ── FED TO MODEL ── {name} -> {result[:200]}")
+                if name == "read_file":
+                    # Pretty-print the read request + returned content (full).
+                    _p = args.get("path", "?")
+                    print(f"  ── FILE READ ── {_p}")
+                    try:
+                        _rd = json.loads(result)
+                        if _rd.get("ok"):
+                            print(_pretty_json({"path": _rd.get("path"),
+                                                "content": _rd.get("content", ""),
+                                                "size": _rd.get("size")}))
+                        else:
+                            print(f"  read_file error: {_safe_log(_rd.get('error'))}")
+                    except Exception:
+                        print(f"  ── MALFORMED read_file RESULT (safe-logged) ── {_safe_log(result)}")
+
+                # ── FED TO MODEL (received): pretty-print the result ──
+                print(f"  ── FED TO MODEL ── {name}")
+                try:
+                    print(_pretty_json(result))
+                except Exception:
+                    print(_safe_log(result))
                 conversation.append({
                     "turn": turn, "role": "tool",
                     "name": name, "content": result,
@@ -2329,6 +2397,11 @@ def main():
         score = result
         results_summary.append(score_to_row(model, run_dir, score))
 
+        # Flush stdout so tool_benchmark.log keeps pace with Ollama as we move
+        # from one model to the next (the pipe to `tee` is fully buffered
+        # otherwise and lags far behind the live terminal).
+        sys.stdout.flush()
+
     results_summary.sort(key=lambda x: x["score"], reverse=True)
     _write_ranking(results_summary)
 
@@ -2342,6 +2415,13 @@ def main():
 
 if __name__ == "__main__":
     import sys as _sys
+    # Line-buffer stdout so every print flushes immediately through the `tee`
+    # pipe — keeps tool_benchmark.log in step with the live Ollama run instead
+    # of lagging many models behind. (Python >=3.7.)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     args = set(_sys.argv[1:])
     if "--clean" in args:
         # Deduplicate ranking + delete losing run dirs, then regen tables.
