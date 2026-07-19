@@ -1607,6 +1607,33 @@ def run_model_benchmark(model):
 
         if not tool_calls and content and not jq_passed:
             print(f"  ⚠ jq audit FAILED — raw output is not valid JSON")
+            # Persist the failed stream for the user to inspect: a consolidated,
+            # clearly-labeled log of every turn whose raw output failed the jq
+            # JSON-validity audit (mirrors the per-turn raw_output_turnN.txt but
+            # with a header so the failure is obvious).
+            with open(os.path.join(run_dir, "failed_streams.log"), "a") as _fs:
+                _fs.write(f"\n=== Turn {turn} — jq audit FAILED (raw output is not valid JSON) ===\n")
+                _fs.write(content + "\n")
+            # Record the failure in the persisted conversation transcript so it
+            # is visible in conversation.json (not just in failed_streams.log).
+            conversation.append({
+                "turn": turn, "role": "jq_audit_failed", "content": content
+            })
+            # Send the error back to the model as a normal turn so it can
+            # self-correct — same convention as the compile/hash-failure paths.
+            # Tool-call-specific: tell it to emit write_file JSON, raw (no fences).
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous response was not valid JSON, so the tool call "
+                    "could not be parsed. Respond with RAW JSON only (no markdown "
+                    "fences, no prose) using the write_file tool, e.g. "
+                    '{"name": "write_file", "arguments": {"path": "hashprime.java", '
+                    '"content": "public class hashprime { ... }"}}.'
+                ),
+                "fed_to_model": True,
+            })
 
         # Semantic gate: check if model output is on-topic
         semantic_passed, sem_score, sem_hit = semantic_gate_check(content)
