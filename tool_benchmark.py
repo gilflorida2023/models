@@ -865,39 +865,59 @@ def thinking_quality_score(thinking_text):
 
 def _verify_large_n(run_dir, n, exp_hash, exp_count, prefix):
     """Run hashprime at N=n, hash the output, compare to the manifest.
-    Returns (match, count_match, exec_time, hash, error)."""
+    Returns (match, count_match, exec_time, hash, error).
+
+    Retries transient java failures (intermittent ClassNotFoundException /
+    classpath races seen under subprocess with an absolute -cp), and uses
+    `cwd=run_dir` with `-cp .` to match the working interactive invocation.
+    """
     rd_abs = os.path.abspath(run_dir)
-    start = time.time()
-    try:
-        r = subprocess.run(
-            ["java", "-cp", rd_abs, "hashprime", str(n)],
-            capture_output=True, text=True, timeout=600, cwd=rd_abs
-        )
-        exec_time = time.time() - start
-        if r.returncode == 0:
-            # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
-            tmp_path = os.path.join(rd_abs, "tempoutput.txt")
-            if not os.path.exists(tmp_path):
-                return False, False, exec_time, "", f"tempoutput.txt not found — program must write primes there"
-            with open(tmp_path, "rb") as f:
-                out = f.read()
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            h = hashlib.sha256(out).hexdigest()
-            match = (h == exp_hash)
-            try:
-                cnt = sum(1 for line in out.split(b"\n") if line.strip())
-            except Exception:
-                cnt = None
-            count_match = (cnt == exp_count)
-            print(f"  ── large-N ({prefix}) ── hash_match={match} "
-                  f"count_match={count_match} ({exec_time:.2f}s)")
-            return match, count_match, exec_time, h, ""
-        return False, False, exec_time, "", f"java rc={r.returncode}: {r.stderr[:200]}"
-    except Exception as e:
-        return False, False, time.time() - start, "", str(e)
+    last_err = ""
+    for attempt in range(3):
+        start = time.time()
+        try:
+            r = subprocess.run(
+                ["java", "-cp", ".", "hashprime", str(n)],
+                capture_output=True, text=True, timeout=600, cwd=rd_abs
+            )
+            exec_time = time.time() - start
+            if r.returncode == 0:
+                # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
+                tmp_path = os.path.join(rd_abs, "tempoutput.txt")
+                if not os.path.exists(tmp_path):
+                    last_err = "tempoutput.txt not found — program must write primes there"
+                    if attempt < 2:
+                        time.sleep(0.5)
+                        continue
+                    return False, False, exec_time, "", last_err
+                with open(tmp_path, "rb") as f:
+                    out = f.read()
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                h = hashlib.sha256(out).hexdigest()
+                match = (h == exp_hash)
+                try:
+                    cnt = sum(1 for line in out.split(b"\n") if line.strip())
+                except Exception:
+                    cnt = None
+                count_match = (cnt == exp_count)
+                print(f"  ── large-N ({prefix}) ── hash_match={match} "
+                      f"count_match={count_match} ({exec_time:.2f}s)")
+                return match, count_match, exec_time, h, ""
+            last_err = f"java rc={r.returncode}: {r.stderr[:200]}"
+            if attempt < 2:
+                time.sleep(0.5)
+                continue
+            return False, False, exec_time, "", last_err
+        except Exception as e:
+            last_err = str(e)
+            if attempt < 2:
+                time.sleep(0.5)
+                continue
+            return False, False, time.time() - start, "", last_err
+    return False, False, 0.0, "", last_err
 
 
 def try_compile_and_verify(run_dir):
@@ -969,31 +989,44 @@ def try_compile_and_verify(run_dir):
 
     # Run and verify hash
     for n in [11, 12]:
-        try:
-            start = time.time()
-            r = subprocess.run(
-                ["java", "-cp", run_dir, "hashprime", str(n)],
-                capture_output=True, text=True, timeout=30, cwd=run_dir
-            )
-            result["exec_time"] += time.time() - start
-            if r.returncode == 0:
-                result["output"] = r.stdout
-                # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
-                tmp_path = os.path.join(run_dir, "tempoutput.txt")
-                if os.path.exists(tmp_path):
-                    with open(tmp_path, "rb") as f:
-                        prime_bytes = f.read()
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                    sha = hashlib.sha256(prime_bytes).hexdigest()
-                    if sha == EXPECTED_HASH:
-                        result["hash_match"] = True
+        matched = False
+        for attempt in range(3):
+            try:
+                start = time.time()
+                r = subprocess.run(
+                    ["java", "-cp", ".", "hashprime", str(n)],
+                    capture_output=True, text=True, timeout=30, cwd=run_dir
+                )
+                result["exec_time"] += time.time() - start
+                if r.returncode == 0:
+                    result["output"] = r.stdout
+                    # Hash the prime bytes in tempoutput.txt (stdout shows only the hash)
+                    tmp_path = os.path.join(run_dir, "tempoutput.txt")
+                    if os.path.exists(tmp_path):
+                        with open(tmp_path, "rb") as f:
+                            prime_bytes = f.read()
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                        sha = hashlib.sha256(prime_bytes).hexdigest()
+                        if sha == EXPECTED_HASH:
+                            matched = True
+                            break
+                    else:
+                        if attempt < 2:
+                            time.sleep(0.5)
+                            continue
                 else:
-                    result["hash_match"] = False
-        except:
-            pass
+                    if attempt < 2:
+                        time.sleep(0.5)
+                        continue
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.5)
+                    continue
+        if matched:
+            result["hash_match"] = True
 
     # Large-N validation against the A000040 manifest at two checkpoints.
     # Proves the sieve scales and isn't a hardcoded small-N trick.
@@ -1626,9 +1659,12 @@ def run_model_benchmark(model):
     # class is correct. If the class compiled but large-N was not verified
     # (empty hash), re-run try_compile_and_verify now (on its own budget,
     # untimed) so a correct-but-slow model is not recorded as a false negative.
+    # NOTE: fires for BOTH tool_call and text modes — do NOT gate on
+    # did_compile_verify, which is only set in text-mode paths; tool-call
+    # models (e.g. satgeze) would otherwise never get their false negatives
+    # corrected.
     if (timing.get("compile_ok")
             and os.path.exists(os.path.join(run_dir, "hashprime.java"))
-            and did_compile_verify
             and not timing.get("large_n_match")
             and not timing.get("large_n2_match")):
         try:
@@ -1977,7 +2013,28 @@ def main():
     results_summary = []
 
     for model in chat_models:
-        result, run_dir = run_model_benchmark(model)
+        try:
+            result, run_dir = run_model_benchmark(model)
+        except Exception as e:
+            # A single model's failure (e.g. transient Ollama connection drop)
+            # must not abort the whole benchmark. Record it and continue.
+            print(f"  FATAL: model {model} crashed the run: {e}")
+            results_summary.append({
+                "model": model,
+                "model_short": model[:25],
+                "score": 0, "correct": 0, "compile_ok": False, "hash_match": False,
+                "speed": 0, "quality": 0, "tools": 0, "violations": 0,
+                "turns_used": 0, "exec_time_secs": 0, "exec_str": "-",
+                "model_time_secs": 0, "time_str": "-", "gen_tok_s": 0.0,
+                "tools_used": "", "mode": "?", "javac_w": 0, "cs": 0, "pmd": 0,
+                "sem_tag": "✗", "sem_score": 0.0, "tool_ok": "✗", "think_tag": "✗",
+                "thinking_support": False, "think_score": 0, "thinking_quality_chunks": 0,
+                "thinking_quality_mean_sim": 0.0, "thinking_quality_error": str(e)[:200],
+                "prompt_ts": 0.0, "thinking_drift": None, "retr_tag": "✗",
+                "large_n_tag": "✗", "large_n2_tag": "✗", "used_retrieval": False,
+                "jq_passed": False, "has_write_file": False, "run_dir": "",
+            })
+            continue
         if isinstance(result, dict) and result.get("skipped"):
             print(f"  (skipped {model}: {result.get('reason')})")
             continue
