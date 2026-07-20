@@ -8,7 +8,59 @@ Handles both native tool-calling models and text-only models (extracts code).
 """
 
 import json, os, sys, time, subprocess, hashlib, re, shutil
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+class _TimestampStream:
+    """Wrap a text stream and prefix every logical line with an RFC 3339 UTC
+    timestamp (e.g. 2026-07-20T18:02:15.123Z). Auto-flushes after each newline
+    so the benchmark log streams in real time through `tee`. Presentation-only;
+    it does not alter what is logged."""
+    def __init__(self, wrapped):
+        self._w = wrapped
+        self._at_line_start = True
+
+    def write(self, s):
+        if not s:
+            return
+        out = []
+        parts = s.split("\n")
+        for i, seg in enumerate(parts):
+            if i > 0:
+                out.append("\n")
+                # A newline was just emitted, so the next segment starts a new
+                # logical line (even if it is the empty trailing segment).
+                self._at_line_start = True
+            if self._at_line_start and seg != "":
+                out.append(_ts())
+            out.append(seg)
+        # If s did not end with a newline, the final segment was a continuation
+        # and the next write is NOT at a line start.
+        if not s.endswith("\n"):
+            self._at_line_start = False
+        text = "".join(out)
+        try:
+            self._w.write(text)
+            if "\n" in text:
+                self._w.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self._w.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._w, name)
+
+
+def _ts():
+    """RFC 3339 UTC timestamp, millisecond precision, e.g.
+    2026-07-20T18:02:15.123Z (trailing space for readability)."""
+    dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z "
 
 # Heavy/optional deps are imported lazily so the module still loads (e.g. for
 # standalone Java verification) on a machine without numpy / qdrant / chonkie.
@@ -1849,12 +1901,20 @@ def run_model_benchmark(model, director=None):
     did_compile_verify = False
     stall_counter = {}  # content_hash -> count, to detect repeated failures
     director_turns = 0  # how many director coaching turns have been issued
+    hints_fed_this_turn = 0  # count of hint material fed to the coder this turn
 
     for turn in range(1, MAX_TURNS + 1):
         elapsed = time.time() - start_time
         if elapsed > PER_MODEL_TIMEOUT:
             print(f"  TIMEOUT ({PER_MODEL_TIMEOUT}s reached)")
             break
+
+        # Report hint material fed to the coder on the previous turn (director
+        # coaching + search_solutions reference chunks — the "killing with
+        # kindness" surface), then reset the per-turn counter.
+        if turn > 1:
+            print(f"  ── Turn {turn - 1} HINTS FED TO CODER: {hints_fed_this_turn} ──")
+        hints_fed_this_turn = 0
 
         # ── Director (coach-only) step ──
         # After turn 1, if a director is configured and the solution is not yet
@@ -1896,7 +1956,7 @@ def run_model_benchmark(model, director=None):
                             "completion_tokens": _dtok,
                             "duration_s": round(_d_dur, 3),
                         })
-                        print(f"  ── DIRECTOR | COACH (turn {turn}, #{director_turns}) ──")
+                        print(f"  ── DIRECTOR | COACH (turn {turn}, #{director_turns}) ── [FED TO CODER] dur={_d_dur:.1f}s ──")
                         print(f"    {_dcoach[:400]}")
                         # Raw director coaching text, full (not truncated).
                         try:
@@ -1912,6 +1972,7 @@ def run_model_benchmark(model, director=None):
                             "turn": turn, "role": "director", "content": _dcoach,
                             "actor": "director",
                         })
+                        hints_fed_this_turn += 1
                 except Exception as e:
                     print(f"  DIRECTOR CALL ERROR (continuing without coaching): {e}")
 
@@ -2122,7 +2183,8 @@ def run_model_benchmark(model, director=None):
                     try:
                         data = json.loads(result)
                         n_hits = len(data.get("results", []))
-                        print(f"  search_solutions returned {n_hits} reference chunk(s)")
+                        print(f"  search_solutions returned {n_hits} reference chunk(s) [FED TO CODER]")
+                        hints_fed_this_turn += n_hits
                     except: pass
 
                 if name == "run_junit_verification":
@@ -2299,6 +2361,7 @@ def run_model_benchmark(model, director=None):
                 print(f"  No code found in response.")
                 break
 
+    print(f"  ── Turn {turn} HINTS FED TO CODER: {hints_fed_this_turn} ──")
     timing["total_seconds"] = time.time() - start_time
     timing["javac_warnings"] = javac_warnings
     timing["turns_used"] = len([m for m in conversation if m.get("role") == "assistant"])
@@ -2725,6 +2788,13 @@ def clean_results(regen=True, purge=False, dry_run=False):
 
 
 def main(director=None, model_filter=None):
+    # Timestamp every log line (RFC 3339 UTC) and stream in real time. Wrapping
+    # both stdout and stderr means the merged `2>&1 | tee` log is fully stamped.
+    if not isinstance(sys.stdout, _TimestampStream):
+        sys.stdout = _TimestampStream(sys.stdout)
+    if not isinstance(sys.stderr, _TimestampStream):
+        sys.stderr = _TimestampStream(sys.stderr)
+
     os.makedirs(RESULTS_BASE, exist_ok=True)
 
     resp = requests.get("http://localhost:11434/api/tags", timeout=10)
