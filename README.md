@@ -300,3 +300,39 @@ manifest (`4883963d…` and `36d61978…` respectively). The program prints ONLY
 hash to stdout; the harness compares it directly against the manifest.
 This neutralizes any "don't write a file" micro-optimization advantage, since at
 scale the algorithm dominates runtime.
+
+## Two-LLM collaboration harness (Writer + Reviewer)
+
+`agent_pair.py` runs **two local LLMs on a shared coding project**, coordinated by
+a Python orchestrator and **managed with tmux** (each agent runs as its own process
+in its own tmux pane — crash isolation + live `tmux attach` visibility).
+
+Topology: a **Writer** agent edits the code (tools: `write_file`, `run_shell`,
+`submit`); a **Reviewer** agent critiques the current source + build output. The
+orchestrator feeds the reviewer's notes back into the writer's next turn. Correctness
+is anchored on the target project's own check (for `simplesieve`:
+`./simplesieve --limit 1e6 -c` must print `78498`).
+
+LLM calls go through Ollama's `/api/chat` (reused from `tool_benchmark.call_ollama`)
+with a Go-appropriate tool schema. tmux only manages the agent *processes*; it does
+not sit in the model-call path. Models that emit tool calls as fenced/multi-object
+JSON text (common for small coders) are transparently recovered.
+
+Run:
+
+```bash
+./tmux_agents.sh                                  # writer=qwen2.5-coder:7b reviewer=qwen3:8b
+./tmux_agents.sh --writer MODEL --reviewer MODEL
+python agent_pair.py --project https://github.com/user/repo.git
+python agent_pair.py --no-tmux                     # agents in-process (no tmux panes)
+tmux attach -t simplesieve_pair                    # watch the agents live
+```
+
+Artifacts (gitignored, under `workspace/`):
+- `workspace/<project>/` — cloned target repo
+- `workspace/mailbox/` — agent task/response files + `review.json`
+- `workspace/agent_pair_report.json` — per-run report (verification result, transcript)
+
+Note: `workspace/` and `tools/` are gitignored so model binaries and cloned
+repos never get committed.
+

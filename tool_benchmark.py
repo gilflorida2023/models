@@ -458,6 +458,9 @@ def tool_compile_java(args, run_dir):
             "stdout": response["stdout"],
             "stderr": response["stderr"],
         }
+        # HARD GUARD: lint is user-only and must never reach the model. If a
+        # regression ever adds checkstyle/PMD to this payload, fail loudly.
+        _assert_no_lint_leak(model_response)
         return json.dumps(model_response)
     except subprocess.TimeoutExpired:
         return json.dumps({"ok": False, "error": "Compilation timed out"})
@@ -859,6 +862,27 @@ def is_chat_model(model):
 CHECKSTYLE_ENABLED = os.path.exists(CHECKSTYLE_JAR)
 PMD_ENABLED = os.path.exists(PMD_BIN)
 
+# Lint (checkstyle/PMD) is informational and USER-ONLY. These markers are used
+# by _assert_no_lint_leak to guarantee lint content is never placed in a payload
+# that gets sent to the model.
+LINT_LEAK_MARKERS = ("checkstyle", "pmd")
+
+
+def _assert_no_lint_leak(payload):
+    """Hard guard: raise if a model-facing payload would leak lint content.
+
+    Lint results (checkstyle/PMD) are for the user's report only and must never
+    reach the model. If a future change accidentally adds a lint key to the
+    payload handed back to the model, fail loudly instead of silently leaking.
+    """
+    lowered = payload.lower() if isinstance(payload, str) else json.dumps(payload).lower()
+    for marker in LINT_LEAK_MARKERS:
+        if marker in lowered:
+            raise RuntimeError(
+                f"LINT LEAK GUARD: model-facing payload contains lint marker '{marker}'. "
+                f"Lint must never be sent to the model (user-only). Payload: {lowered[:200]}"
+            )
+
 
 def run_checkstyle(java_path, run_dir):
     if not CHECKSTYLE_ENABLED:
@@ -872,7 +896,13 @@ def run_checkstyle(java_path, run_dir):
             capture_output=True, text=True, timeout=30, cwd=run_dir
         )
         elapsed = time.time() - start
-        lines = [l for l in result.stdout.split("\n") if l.strip()]
+        # Only count actual violations ([WARN] lines). Checkstyle also prints
+        # "Starting audit..." / "Audit done." bookends (and possibly [ERROR]
+        # lines on config problems) which must not inflate the VIOL score.
+        lines = [
+            l for l in result.stdout.split("\n")
+            if l.strip().startswith("[WARN]")
+        ]
         count = len(lines)
         if count > 0:
             print(f"  ── Checkstyle ({count} violations) ──")
@@ -1405,13 +1435,20 @@ def score_run(run_dir, conversation, timing, mode):
     cs_score = _score_warnings(checkstyle_count, [(0, 100), (5, 80), (15, 60), (999, 30)])
     pmd_score = _score_warnings(pmd_count, [(0, 100), (3, 80), (8, 60), (999, 30)])
 
-    score["code_quality"] = int(javac_score * 0.4 + cs_score * 0.3 + pmd_score * 0.3)
+    # LINT IS INFORMATIONAL ONLY — it must NOT validate or affect code quality.
+    # code_quality reflects compile cleanliness (javac warnings) alone; checkstyle/
+    # PMD counts are recorded in details and surfaced in the VIOL column for the
+    # user, but they never feed total. (See also the LINT LEAK guard in
+    # tool_compile_java: lint is also never sent to the model.)
+    score["code_quality"] = int(javac_score)
     score["details"]["javac_warnings"] = javac_warnings
     score["details"]["checkstyle_count"] = checkstyle_count
     score["details"]["pmd_count"] = pmd_count
     score["details"]["javac_score"] = javac_score
     score["details"]["checkstyle_score"] = cs_score
     score["details"]["pmd_score"] = pmd_score
+    # Informational-only combined lint score (NOT used in total).
+    score["details"]["lint_score"] = int(cs_score * 0.5 + pmd_score * 0.5)
 
     # Tool usage - check both native API calls and text-based tool dispatches
     tools_used = set()
@@ -1866,6 +1903,14 @@ def run_model_benchmark(model):
 
                 # ── FED TO MODEL (received): pretty-print the result ──
                 print(f"  ── FED TO MODEL ── {name}")
+                # Defense-in-depth: if lint ever slips into a payload sent to the
+                # model, warn loudly (the hard guard in tool_compile_java already
+                # prevents this by raising, but this catches any other path).
+                if name == "compile_java" and any(
+                    m in result.lower() for m in LINT_LEAK_MARKERS
+                ):
+                    print("  ⚠ LINT LEAK: checkstyle/PMD content reached FED TO MODEL — "
+                          "lint is user-only and must never be sent to the model.")
                 try:
                     print(_pretty_json(result))
                 except Exception:
