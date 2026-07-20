@@ -31,6 +31,9 @@ RESULTS_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results
 OLLAMA_URL = "http://localhost:11434/api/chat"
 PER_MODEL_TIMEOUT = 600
 MAX_TURNS = 20
+# Cap on director coaching turns per coder run, so a stuck director/coder can't
+# loop forever. The coder still gets its own MAX_TURNS budget for tool calls.
+DIRECTOR_MAX_TURNS = 8
 EXPECTED_HASH = "563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc"
 
 # Large-N validation: confirm the sieve actually scales (and isn't a hardcoded
@@ -137,6 +140,11 @@ Tool: read_file
   Arguments: path (string) - file to read, relative to the working directory
   Example: {"name": "read_file", "arguments": {"path": "hashprime.java"}}
 
+Tool: list_dir
+  Description: List the files in the working directory and their sizes. Use it after writing or compiling to confirm what exists (e.g. that hashprime.java was created and hashprime.class appeared after a successful compile). Paths are relative to the working directory.
+  Arguments: none
+  Example: {"name": "list_dir", "arguments": {}}
+
 Tool: compile_java
   Description: Compile hashprime.java with javac
   Arguments: none
@@ -158,15 +166,37 @@ Tool: search_solutions
   Example: {"name": "search_solutions", "arguments": {"query": "Sieve of Eratosthenes feed primes to SHA-256"}}
 """
 
+def _load_prompt_file(name):
+    """Load a prompt fragment from a .txt file on disk (editable without
+    touching this script). Returns '' if the file is missing."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
 def _load_prompt_body():
     """Load the task-specific prompt body from prompt.hashprime.txt so the
     prompt can be edited on disk without touching this script."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.hashprime.txt")
-    with open(path) as f:
-        return f.read()
+    return _load_prompt_file("prompt.hashprime.txt")
 
 
-PROMPT = "You are solving a Java programming challenge. You have access to tools to write files, compile, run commands, and verify results.\n" + TOOL_DESCRIPTIONS + "\n" + _load_prompt_body()
+# Task goal (shared by both roles). Loaded fresh so edits to disk take effect.
+TASK_BODY = _load_prompt_body()
+
+# Baseline coder prompt (no director): kept as the original single-prompt form.
+PROMPT = ("You are solving a Java programming challenge. You have access to tools "
+          "to write files, compile, run commands, and verify results.\n"
+          + TOOL_DESCRIPTIONS + "\n" + TASK_BODY)
+
+# Role prompts, loaded separately from the task goal (prompt.hashprime.txt).
+# Both roles share the SAME tool schema/descriptions and the SAME task body; they
+# differ only in their role/behavior description. The Director is coach-only and
+# must never write code; the Coder writes all code and follows the Director.
+CODER_SYSTEM = _load_prompt_file("prompt.coder.txt") + "\n" + TOOL_DESCRIPTIONS + "\n" + TASK_BODY
+DIRECTOR_SYSTEM = _load_prompt_file("prompt.director.txt") + "\n" + TOOL_DESCRIPTIONS + "\n" + TASK_BODY
 
 
 # === Code extraction ===
@@ -373,6 +403,25 @@ def tool_read_file(args, run_dir):
     with open(full_path) as f:
         content = f.read()
     return json.dumps({"ok": True, "path": path, "content": content, "size": len(content)})
+
+
+def tool_list_dir(args, run_dir):
+    """List the working directory so a model can observe its own files
+    (e.g. confirm hashprime.java was written and hashprime.class exists after
+    a compile). Sandboxed to run_dir — never escapes the working directory."""
+    try:
+        entries = []
+        for name in sorted(os.listdir(run_dir)):
+            full = os.path.join(run_dir, name)
+            try:
+                sz = os.path.getsize(full)
+            except OSError:
+                sz = None
+            entries.append({"name": name, "size": sz,
+                             "type": "dir" if os.path.isdir(full) else "file"})
+        return json.dumps({"ok": True, "path": ".", "entries": entries})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
 
 
 def tool_run_command(args, run_dir):
@@ -672,6 +721,7 @@ def tool_run_junit_verification(args, run_dir):
 TOOL_DISPATCH = {
     "write_file": tool_write_file,
     "read_file": tool_read_file,
+    "list_dir": tool_list_dir,
     "run_command": tool_run_command,
     "compile_java": tool_compile_java,
     "run": tool_run,
@@ -717,6 +767,37 @@ TOOL_SCHEMA = [
                     "path": {"type": "string", "description": "Path of the file to read, relative to the working directory (e.g. 'hashprime.java')."},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": (
+                "List the files in the working directory and their sizes. Use it "
+                "after writing or compiling to confirm what exists (e.g. that "
+                "hashprime.java was created and hashprime.class appeared after a "
+                "successful compile). Paths are relative to the working directory."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Run an arbitrary shell command in the working directory (e.g. "
+                "'ls -la' to inspect files, or a custom java invocation). Output is "
+                "truncated to the last 2000 bytes of stdout/stderr."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to run (e.g. 'ls -la')."},
+                },
+                "required": ["command"],
             },
         },
     },
@@ -1467,7 +1548,7 @@ def score_run(run_dir, conversation, timing, mode):
     if mode != "tool_call" and (not jq_audit_passed or not semantic_passed):
         score["tool_usage"] = 0
     else:
-        expected_tools = {"write_file", "compile_java", "run", "submit_answer"}
+        expected_tools = {"write_file", "read_file", "list_dir", "compile_java", "run", "submit_answer"}
         used = len(tools_used & expected_tools)
         score["tool_usage"] = int((used / len(expected_tools)) * 100)
     score["details"]["tools_used"] = sorted(tools_used) if tools_used else ["(none)"]
@@ -1495,6 +1576,8 @@ def score_run(run_dir, conversation, timing, mode):
     score["details"]["prompt_ts"] = prompt_ts
     score["details"]["thinking_drift"] = round(tq_mean - prompt_ts, 4) if (tq_mean and prompt_ts) else None
     score["details"]["used_retrieval"] = timing.get("used_retrieval", False)
+    score["details"]["director"] = timing.get("director")
+    score["details"]["director_turns"] = timing.get("director_turns", 0)
 
     score["total"] = int(
         score["correctness"] * 0.5 +
@@ -1623,7 +1706,48 @@ def call_ollama(model, messages, capabilities=None, timeout=300):
     }
 
 
-def run_model_benchmark(model):
+def _build_director_transcript(run_dir, messages, timing):
+    """Build a condensed transcript for the Director (coach-only) to reason over.
+    Includes: verify status, the last tool result the coder received, and the
+    current hashprime.java source. Sandboxed to run_dir."""
+    parts = []
+    parts.append("=== VERIFICATION STATUS ===")
+    parts.append(f"compile_ok: {timing.get('compile_ok')}")
+    parts.append(f"hash_match (small-N): {timing.get('hash_match')}")
+    parts.append(f"large_n_match (1e6): {timing.get('large_n_match')}")
+    parts.append(f"large_n2_match (1e7): {timing.get('large_n2_match')}")
+    parts.append(f"javac_warnings: {timing.get('javac_warnings')}")
+
+    # Last tool result the coder actually received (role 'tool').
+    last_tool = None
+    for m in reversed(messages):
+        if m.get("role") == "tool":
+            last_tool = m
+            break
+    if last_tool is not None:
+        parts.append("\n=== LAST TOOL RESULT THE CODER RECEIVED ===")
+        _tr = last_tool.get("content", "")
+        parts.append(_tr[:2000])
+
+    # Current source the coder has written.
+    java_path = os.path.join(run_dir, "hashprime.java")
+    parts.append("\n=== CURRENT hashprime.java ===")
+    if os.path.exists(java_path):
+        with open(java_path) as f:
+            parts.append(f.read()[:4000])
+    else:
+        parts.append("(hashprime.java does not exist yet)")
+
+    parts.append("\n=== YOUR JOB ===")
+    parts.append("Coach the coder. Identify the specific bug and tell it the exact "
+                 "fix. Do NOT write or edit code yourself. If it is stuck, give it "
+                 "the single next step (e.g. 'run list_dir to confirm hashprime.class "
+                 "was produced'). Keep it focused on the VALIDATION CONTRACT: stdout "
+                 "must be ONLY the lowercase-hex SHA-256 of the prime bytes.")
+    return "\n".join(parts)
+
+
+def run_model_benchmark(model, director=None):
     model_clean = model.replace("/", "_").replace(":", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(RESULTS_BASE, model_clean, timestamp)
@@ -1645,6 +1769,8 @@ def run_model_benchmark(model):
 
     print(f"\n{'='*60}")
     print(f"Testing model: {model}")
+    if director:
+        print(f"Director (coach): {director}  [coach-only; coder writes all code]")
     print(f"Results: {run_dir}")
     print(f"  capabilities: {sorted(capabilities)}")
     print(f"{'='*60}")
@@ -1653,12 +1779,18 @@ def run_model_benchmark(model):
     print("  Cleaning up previous models...")
     cleanup_all_models()
     warmup_model(model)
+    if director:
+        warmup_model(director)
 
-    messages = [{"role": "user", "content": PROMPT}]
+    # The coder's opening system/task message. With a director, the coder gets
+    # the separate role prompt (prompt.coder.txt); without, the baseline PROMPT.
+    coder_intro = CODER_SYSTEM if director else PROMPT
+    messages = [{"role": "user", "content": coder_intro}]
     conversation = []
     timing = {"total_seconds": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "capabilities": sorted(capabilities),
               "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None,
               "large_n2_match": False, "large_n2_count_match": False, "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": ""}
+    timing["director"] = director
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
@@ -1668,12 +1800,53 @@ def run_model_benchmark(model):
     mode = "tool_call"  # or "text"
     did_compile_verify = False
     stall_counter = {}  # content_hash -> count, to detect repeated failures
+    director_turns = 0  # how many director coaching turns have been issued
 
     for turn in range(1, MAX_TURNS + 1):
         elapsed = time.time() - start_time
         if elapsed > PER_MODEL_TIMEOUT:
             print(f"  TIMEOUT ({PER_MODEL_TIMEOUT}s reached)")
             break
+
+        # ── Director (coach-only) step ──
+        # After turn 1, if a director is configured and the solution is not yet
+        # correct, ask the director to coach the coder based on the condensed
+        # transcript (last tool result + current source + verify status). The
+        # director's coaching is injected as a user turn the coder sees THIS turn.
+        # The director NEVER writes code (enforced by its role prompt + this code
+        # path, which only forwards its text, never applies it as a file edit).
+        if director and turn > 1 and director_turns < DIRECTOR_MAX_TURNS:
+            _solved = timing.get("hash_match") and timing.get("compile_ok")
+            if not _solved:
+                _dtrans = _build_director_transcript(run_dir, messages, timing)
+                try:
+                    _dresp = call_ollama(
+                        director,
+                        [{"role": "user", "content": DIRECTOR_SYSTEM},
+                         {"role": "user", "content": _dtrans}],
+                        capabilities=get_model_capabilities(director),
+                    )
+                    _dcoach = _dresp.get("message", {}).get("content", "").strip()
+                    _dtok = _dresp.get("completion_tokens", 0)
+                    if _dcoach:
+                        director_turns += 1
+                        total_prompt_tokens += _dresp.get("prompt_tokens", 0)
+                        total_completion_tokens += _dtok
+                        timing.setdefault("token_log", []).append({
+                            "turn": turn, "role": "director",
+                            "prompt_tokens": _dresp.get("prompt_tokens", 0),
+                            "completion_tokens": _dtok,
+                        })
+                        print(f"  ── DIRECTOR COACH (turn {turn}, #{director_turns}) ──")
+                        print(f"    {_dcoach[:400]}")
+                        messages.append({
+                            "role": "user", "content": _dcoach, "fed_to_model": True,
+                        })
+                        conversation.append({
+                            "turn": turn, "role": "director", "content": _dcoach,
+                        })
+                except Exception as e:
+                    print(f"  DIRECTOR CALL ERROR (continuing without coaching): {e}")
 
         print(f"\n--- Turn {turn} ---")
 
@@ -1901,6 +2074,18 @@ def run_model_benchmark(model):
                     except Exception:
                         print(f"  ── MALFORMED read_file RESULT (safe-logged) ── {_safe_log(result)}")
 
+                if name == "list_dir":
+                    print(f"  ── DIR LISTING ──")
+                    try:
+                        _ld = json.loads(result)
+                        if _ld.get("ok"):
+                            for _e in _ld.get("entries", []):
+                                print(f"    {_e['type']:>4}  {_e['size'] if _e['size'] is not None else '-':>8}  {_e['name']}")
+                        else:
+                            print(f"  list_dir error: {_safe_log(_ld.get('error'))}")
+                    except Exception:
+                        print(f"  ── MALFORMED list_dir RESULT (safe-logged) ── {_safe_log(result)}")
+
                 # ── FED TO MODEL (received): pretty-print the result ──
                 print(f"  ── FED TO MODEL ── {name}")
                 # Defense-in-depth: if lint ever slips into a payload sent to the
@@ -2031,6 +2216,7 @@ def run_model_benchmark(model):
     timing["total_seconds"] = time.time() - start_time
     timing["javac_warnings"] = javac_warnings
     timing["turns_used"] = len([m for m in conversation if m.get("role") == "assistant"])
+    timing["director_turns"] = director_turns
     timing["prompt_tokens"] = total_prompt_tokens
     timing["completion_tokens"] = total_completion_tokens
 
@@ -2146,6 +2332,9 @@ def score_to_row(model, run_dir, score):
         "jq_passed": jq_passed,
         "has_write_file": has_write_file,
         "run_dir": run_dir,
+        "director": score["details"].get("director"),
+        "director_turns": score["details"].get("director_turns", 0),
+        "dir_tag": (score["details"].get("director") or "none"),
     }
 
 
@@ -2201,6 +2390,7 @@ def _write_ranking(results_summary):
         ("large",   "1E6",   5,   "1E6"),
         ("large2",  "1E7",   5,   "1E7"),
         ("mode",    "MODE",  8,   "MODE"),
+        ("dir",     "DIR",   20,  "DIR"),
     ]
 
     def row_values(i, r):
@@ -2235,6 +2425,7 @@ def _write_ranking(results_summary):
             "large": r["large_n_tag"],
             "large2": r["large_n2_tag"],
             "mode": r["mode"],
+            "dir": r["dir_tag"] if isinstance(r.get("dir_tag"), str) else "none",
         }
 
     # Compact per-column legend shown right under the table (console + markdown).
@@ -2259,6 +2450,7 @@ def _write_ranking(results_summary):
         "large":  "1E6 sieve hash == manifest? (PASS/FAIL/ERR)",
         "large2": "1E7 sieve hash == manifest? (PASS/FAIL/ERR)",
         "mode":   "tool_call = native API, text = JSON-in-plaintext",
+        "dir":    "Director (coach) model; 'none' = baseline single-model run (no director)",
     }
 
     # ── Console ranking table ──
@@ -2446,7 +2638,7 @@ def clean_results(regen=True, purge=False, dry_run=False):
     return deduped
 
 
-def main():
+def main(director=None):
     os.makedirs(RESULTS_BASE, exist_ok=True)
 
     resp = requests.get("http://localhost:11434/api/tags", timeout=10)
@@ -2460,6 +2652,13 @@ def main():
     print(f"Found {len(models)} models:")
     for m in models:
         print(f"  - {m}")
+
+    if director:
+        print("=" * 70)
+        print(f"DIRECTOR MODE: {director} coaches every tested model (coach-only).")
+        print("  The coder writes all code; the director only sends guidance. The")
+        print("  DIR column in the ranking shows the director; 'none' = baseline.")
+        print("=" * 70)
 
     # Filter out non-chat models (embedding-only) up front; report them.
     # We skip ONLY models that explicitly report embedding capability; an empty
@@ -2527,7 +2726,7 @@ def main():
 
     for model in chat_models:
         try:
-            result, run_dir = run_model_benchmark(model)
+            result, run_dir = run_model_benchmark(model, director=director)
         except Exception as e:
             # A single model's failure (e.g. transient Ollama connection drop)
             # must not abort the whole benchmark. Record it and continue.
@@ -2579,8 +2778,18 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    args = set(_sys.argv[1:])
-    if "--clean" in args:
+    args = list(_sys.argv[1:])
+    # Parse --director MODEL (takes the following token as the director model).
+    _director = None
+    if "--director" in args:
+        _di = args.index("--director")
+        if _di + 1 < len(args):
+            _director = args[_di + 1]
+        else:
+            print("ERROR: --director requires a model name (e.g. --director qwen3:8b)")
+            _sys.exit(2)
+    arg_set = set(args)
+    if "--clean" in arg_set:
         # Deduplicate ranking + delete losing run dirs, then regen tables.
         clean_results(regen=True, purge=True, dry_run=False)
     elif "--clean-regen" in args:
@@ -2595,4 +2804,4 @@ if __name__ == "__main__":
     elif "--regen" in args:
         regenerate_ranking()
     else:
-        main()
+        main(director=_director)
