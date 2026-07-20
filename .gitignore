@@ -6,3 +6,5 @@ corpora/
 results/
 *.class
 *.jar
+
+tool_benchmark.log

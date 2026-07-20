@@ -994,12 +994,22 @@ def semantic_gate_check(text):
     """Check if model output is semantically on-topic.
     Hard gate based on hashprime_solutions similarity (threshold 0.60).
     Also checks linux_server for context (lower = less sysadmin drift).
-    Returns (passed: bool, max_score: float, best_hit: dict).
+    Returns (passed, max_score, best_hit):
+      - passed=True  -> on-topic (measured)
+      - passed=False -> off-topic (measured, genuinely fails the gate)
+      - passed=None  -> UNAVAILABLE: Qdrant/embedding down or collection missing,
+                         so on-topic-ness could NOT be measured (do NOT treat as fail)
     """
     if not text or len(text.strip()) < 20:
         return False, 0.0, {}
     try:
         qdrant = QdrantClient(path=QDRANT_PATH)
+        # Probe whether the scoring collection exists up front. If it's missing,
+        # report UNAVAILABLE (None) rather than a misleading off-topic FAIL.
+        try:
+            qdrant.get_collection("hashprime_solutions")
+        except Exception:
+            return None, 0.0, {"error": "collection_missing"}
         vec = embed_text(text)
         hp_score = 0.0
         ls_score = 0.0
@@ -1031,7 +1041,8 @@ def semantic_gate_check(text):
         passed = hp_score >= SEMANTIC_THRESHOLD
         return passed, hp_score, best_hit
     except Exception as e:
-        return True, 0.0, {"error": str(e)}  # pass by default on error
+        # Embedding/Qdrant infra error -> UNAVAILABLE, not a model failure.
+        return None, 0.0, {"error": str(e)}
 
 
 def thinking_quality_score(thinking_text):
@@ -1057,7 +1068,7 @@ def thinking_quality_score(thinking_text):
         try:
             qdrant.get_collection("hashprime_solutions")
         except Exception:
-            return 0, 0, 0.0, "collection_missing"
+            return 0, 0, 0.0, "UNAVAILABLE"
 
         texts = [c.text for c in chunks]
         # Embed in batches (Ollama accepts a list input)
@@ -1085,7 +1096,8 @@ def thinking_quality_score(thinking_text):
         mean_sim = sum(sims) / len(sims)
         return int(min(100, max(0, round(mean_sim * 100)))), len(sims), round(mean_sim, 4), None
     except Exception as e:
-        return 0, 0, 0.0, str(e)
+        # Embedding/Qdrant infra error -> UNAVAILABLE, not a model failure.
+        return 0, 0, 0.0, "UNAVAILABLE"
 
 
 # === Compile and verify (used for text-only models) ===
@@ -2015,7 +2027,9 @@ def score_to_row(model, run_dir, score):
     """Convert a finished score dict into a ranking summary row."""
     sem_passed = score["details"].get("semantic_passed", True)
     sem_score = score["details"].get("semantic_score", 0.0)
-    sem_tag = "PASS" if sem_passed else "FAIL"
+    # sem_passed is None when scoring was UNAVAILABLE (Qdrant/collection missing)
+    # — render as N/A so it is never mistaken for a genuine off-topic FAIL.
+    sem_tag = "N/A" if sem_passed is None else ("PASS" if sem_passed else "FAIL")
     tools_used_list = score["details"].get("tools_used", [])
     has_write_file = "write_file" in tools_used_list
     jq_passed = score["details"].get("jq_audit_passed", True)
@@ -2026,6 +2040,10 @@ def score_to_row(model, run_dir, score):
     think_tag = "PASS" if thinking_support else "FAIL"
     used_retrieval = score["details"].get("used_retrieval", False)
     retr_tag = "PASS" if used_retrieval else "FAIL"
+    # Thinking-quality scoring: N/A when the embedding/scoring infra was down,
+    # so a 0 is not mistaken for "reasoning was poor".
+    tq_err = score["details"].get("thinking_quality_error")
+    tq_unavailable = (tq_err == "UNAVAILABLE")
     large_n_match = score["details"].get("large_n_match", False)
     large_n_err = score["details"].get("large_n_error", "")
     large_n_tag = "PASS" if large_n_match else ("ERR" if large_n_err else "FAIL")
@@ -2075,6 +2093,7 @@ def score_to_row(model, run_dir, score):
         "thinking_quality_error": score["details"].get("thinking_quality_error"),
         "prompt_ts": score["details"].get("prompt_ts", 0.0),
         "thinking_drift": score["details"].get("thinking_drift"),
+        "tq_unavailable": tq_unavailable,
         "retr_tag": retr_tag,
         "large_n_tag": large_n_tag,
         "large_n2_tag": large_n2_tag,
@@ -2144,6 +2163,12 @@ def _write_ranking(results_summary):
         h_tag = "PASS" if r["hash_match"] else "FAIL"
         drift = r["thinking_drift"]
         drift_s = f"{drift:+.2f}" if isinstance(drift, (int, float)) else "-"
+        # When thinking-quality scoring was UNAVAILABLE, render TSCORE/DRIFT as N/A
+        # instead of a misleading 0 / "-", so infra outage is never seen as a model flaw.
+        ts_val = r["think_score"]
+        if r.get("tq_unavailable"):
+            ts_val = "N/A"
+            drift_s = "N/A"
         return {
             "rank": i,
             "model": r["model_short"],
@@ -2176,12 +2201,12 @@ def _write_ranking(results_summary):
         "c_tag":  "compiled? (PASS/FAIL)",
         "h_tag":  "SHA-256 hash matches expected? (PASS/FAIL)",
         "viol":   "lint violations (javac+checkstyle+PMD; lower better)",
-        "sem":    "semantic gate pass? (PASS/FAIL)",
+        "sem":    "semantic gate (PASS=on-topic, FAIL=off-topic, N/A=scoring unavailable / Qdrant down — NOT a model failure)",
         "tool":   "tool-call support? (PASS/FAIL)",
         "think":  "thinking/reasoning trace present? (PASS/FAIL)",
         "retr":   "used search_solutions retrieval? (PASS/FAIL)",
-        "ts":     "thinking quality (0-100, vs hashprime_solutions)",
-        "drift":  "TSCORE − prompt baseline (positive=more on-topic)",
+        "ts":     "thinking quality (0-100, vs hashprime_solutions; N/A=scoring unavailable)",
+        "drift":  "TSCORE − prompt baseline (positive=more on-topic; N/A=scoring unavailable)",
         "iter":   "conversation turns used",
         "exec":   "compiled Java execution time",
         "time":   "model wall-clock time (excl. lint)",
@@ -2406,6 +2431,23 @@ def main():
         print(f"\nSkipping {len(skipped_models)} non-chat model(s):")
         for m, caps in skipped_models:
             print(f"  - {m} (capabilities: {caps})")
+
+    # Probe Qdrant semantic-scoring availability up front so a missing
+    # collection (data loss) is reported clearly rather than silently turning
+    # every model's SEM/TSCORE/DRIFT into a misleading FAIL/0.
+    try:
+        from qdrant_client import QdrantClient
+        qc = QdrantClient(path=QDRANT_PATH)
+        qc.get_collection("hashprime_solutions")
+        print("Semantic scoring: Qdrant collection 'hashprime_solutions' available.")
+    except Exception as e:
+        print("=" * 70)
+        print("⚠  SEMANTIC / THINKING SCORING UNAVAILABLE")
+        print("   Qdrant collection 'hashprime_solutions' is missing or Qdrant")
+        print("   is unreachable. SEM, TSCORE and DRIFT will show N/A (not a")
+        print(f"   model failure). Cause: {e}")
+        print("   To restore: python ingest_corpora.py")
+        print("=" * 70)
 
     results_summary = []
 
