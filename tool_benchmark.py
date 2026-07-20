@@ -2448,6 +2448,35 @@ def main():
         print(f"   model failure). Cause: {e}")
         print("   To restore: python ingest_corpora.py")
         print("=" * 70)
+    finally:
+        # CRITICAL: close the probe client so it does not hold the local
+        # Qdrant store lock for the whole run. Qdrant local mode allows only
+        # ONE process/connection at a time; a leaked handle here would make
+        # every later semantic_gate_check / thinking_quality_score /
+        # _prompt_ts call fail with "already accessed by another instance"
+        # and silently fall back to UNAVAILABLE (SEM/TSCORE/DRIFT all N/A).
+        try:
+            qc.close()
+        except Exception:
+            pass
+
+    # Probe lint-tool availability up front so VIOL=0 is not mistaken for a
+    # fully linted clean compile when checkstyle/PMD are simply not installed.
+    if CHECKSTYLE_ENABLED or PMD_ENABLED:
+        parts = []
+        if CHECKSTYLE_ENABLED:
+            parts.append("checkstyle")
+        if PMD_ENABLED:
+            parts.append("PMD")
+        print(f"Lint: {', '.join(parts)} enabled (plus javac warnings).")
+    else:
+        print("=" * 70)
+        print("⚠  STATIC LINT DISABLED")
+        print("   Neither checkstyle.jar nor pmd/bin/pmd found under tools/.")
+        print("   VIOL reflects JAVAC WARNINGS ONLY (not checkstyle/PMD).")
+        print("   To enable: drop checkstyle.jar + checkstyle_config.xml and the")
+        print("   pmd/ distribution into tools/.")
+        print("=" * 70)
 
     results_summary = []
 
