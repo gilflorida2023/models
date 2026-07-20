@@ -1623,7 +1623,7 @@ def save_results(run_dir, model, conversation, timing, score):
     token_log = score["details"].get("token_log", [])
     if token_log:
         per_turn = "\n".join(
-            f"    turn {t['turn']:<3} sent={t['prompt_tokens']:<6} gen={t['completion_tokens']:<5} {t['duration_s']:.2f}s"
+            f"    turn {t['turn']:<3} sent={t['prompt_tokens']:<6} gen={t['completion_tokens']:<5} {t.get('duration_s', 0.0):.2f}s"
             for t in token_log
         )
         token_block = f"\n  Per-turn:\n{per_turn}"
@@ -1706,10 +1706,42 @@ def call_ollama(model, messages, capabilities=None, timeout=300):
     }
 
 
+def _qdrant_solution_hint():
+    """Verify that prior, verified hashprime solutions exist in the Qdrant
+    'hashprime_solutions' collection, and return a short hint the Director can
+    surface to the worker (e.g. 'prior verified solutions exist — suggest the
+    worker call search_solutions'). Returns '' on any failure (never blocks the
+    director step). Pure read; does not modify the store."""
+    try:
+        qdrant = QdrantClient(path=QDRANT_PATH)
+        qdrant.get_collection("hashprime_solutions")
+        # A representative query so we confirm relevant (not just any) chunks exist.
+        vec = embed_text("Sieve of Eratosthenes Java SHA-256 prime bytes")
+        pts = qdrant.query_points(
+            collection_name="hashprime_solutions", query=vec.tolist(), limit=3
+        ).points
+        qdrant.close()
+        if not pts:
+            return ("Qdrant 'hashprime_solutions' collection is present but returned "
+                    "no relevant chunks for this task.")
+        _n_verified = sum(1 for p in pts if (p.payload or {}).get("verified"))
+        _best = pts[0]
+        _snip = ((_best.payload or {}).get("text", "") or "")[:400]
+        return ("VERIFIED PRIOR SOLUTIONS EXIST in the Qdrant 'hashprime_solutions' "
+                f"collection ({_n_verified} verified in top hits). You may tell the "
+                "worker to call search_solutions(query=...) to retrieve known-good "
+                "reference code. Example relevant snippet from a prior solution:\n"
+                + _snip)
+    except Exception as e:
+        return f"(Qdrant solution check skipped: {e})"
+
+
 def _build_director_transcript(run_dir, messages, timing):
     """Build a condensed transcript for the Director (coach-only) to reason over.
-    Includes: verify status, the last tool result the coder received, and the
-    current hashprime.java source. Sandboxed to run_dir."""
+    Includes: verify status, the last N tool results the coder received (flagging
+    bad/unknown tool calls so the Director can critique them), a Qdrant check for
+    existing verified solutions to suggest, and the current hashprime.java source.
+    Sandboxed to run_dir."""
     parts = []
     parts.append("=== VERIFICATION STATUS ===")
     parts.append(f"compile_ok: {timing.get('compile_ok')}")
@@ -1718,16 +1750,23 @@ def _build_director_transcript(run_dir, messages, timing):
     parts.append(f"large_n2_match (1e7): {timing.get('large_n2_match')}")
     parts.append(f"javac_warnings: {timing.get('javac_warnings')}")
 
-    # Last tool result the coder actually received (role 'tool').
-    last_tool = None
-    for m in reversed(messages):
-        if m.get("role") == "tool":
-            last_tool = m
-            break
-    if last_tool is not None:
-        parts.append("\n=== LAST TOOL RESULT THE CODER RECEIVED ===")
-        _tr = last_tool.get("content", "")
-        parts.append(_tr[:2000])
+    # Last N tool results the coder received (role 'tool'), most recent last.
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    last_n = tool_msgs[-3:]
+    if last_n:
+        parts.append("\n=== RECENT TOOL RESULTS THE CODER RECEIVED (oldest→newest) ===")
+        for _i, m in enumerate(last_n, 1):
+            _tr = m.get("content", "")
+            _name = m.get("name", "?")
+            # Flag bad/unknown-tool calls so the Director can critique them.
+            _bad = ("Unknown tool" in _tr) or ("\"ok\": false" in _tr and "error" in _tr)
+            _tag = "  [BAD CALL — critique how to improve it]" if _bad else ""
+            parts.append(f"--- tool result {_i} ({_name}){_tag} ---")
+            parts.append(_tr[:1500])
+
+    # Qdrant solution existence check — Director may suggest search_solutions.
+    parts.append("\n=== REFERENCE SOLUTIONS (Qdrant) ===")
+    parts.append(_qdrant_solution_hint())
 
     # Current source the coder has written.
     java_path = os.path.join(run_dir, "hashprime.java")
@@ -1739,11 +1778,20 @@ def _build_director_transcript(run_dir, messages, timing):
         parts.append("(hashprime.java does not exist yet)")
 
     parts.append("\n=== YOUR JOB ===")
-    parts.append("Coach the coder. Identify the specific bug and tell it the exact "
-                 "fix. Do NOT write or edit code yourself. If it is stuck, give it "
-                 "the single next step (e.g. 'run list_dir to confirm hashprime.class "
-                 "was produced'). Keep it focused on the VALIDATION CONTRACT: stdout "
-                 "must be ONLY the lowercase-hex SHA-256 of the prime bytes.")
+    parts.append(
+        "You are a senior engineer COACHING the coder. You may:\n"
+        "  (1) SUGGEST IDEAS/APPROACHES the coder could try (algorithm variants,\n"
+        "      data-flow structure, how to feed primes to SHA-256 incrementally,\n"
+        "      bit-packing, etc.) — offer 1-3 ranked options with tradeoffs.\n"
+        "  (2) CRITIQUE any BAD TOOL CALLS flagged above: explain what was wrong\n"
+        "      with the tool name/arguments and exactly how to fix the call.\n"
+        "  (3) Point the coder at VERIFIED PRIOR SOLUTIONS in Qdrant by telling it\n"
+        "      to call search_solutions(query=...) — do NOT paste the solution code\n"
+        "      yourself.\n"
+        "RULES: You NEVER write or edit code. You only advise. When the coder is\n"
+        "stuck, give the single best next step. Keep focused on the VALIDATION\n"
+        "CONTRACT: stdout must be ONLY the lowercase-hex SHA-256 of the prime bytes."
+    )
     return "\n".join(parts)
 
 
@@ -1820,12 +1868,14 @@ def run_model_benchmark(model, director=None):
             if not _solved:
                 _dtrans = _build_director_transcript(run_dir, messages, timing)
                 try:
+                    _d_start = time.time()
                     _dresp = call_ollama(
                         director,
                         [{"role": "user", "content": DIRECTOR_SYSTEM},
                          {"role": "user", "content": _dtrans}],
                         capabilities=get_model_capabilities(director),
                     )
+                    _d_dur = time.time() - _d_start
                     _dcoach = _dresp.get("message", {}).get("content", "").strip()
                     _dtok = _dresp.get("completion_tokens", 0)
                     if _dcoach:
@@ -1836,6 +1886,7 @@ def run_model_benchmark(model, director=None):
                             "turn": turn, "role": "director",
                             "prompt_tokens": _dresp.get("prompt_tokens", 0),
                             "completion_tokens": _dtok,
+                            "duration_s": round(_d_dur, 3),
                         })
                         print(f"  ── DIRECTOR COACH (turn {turn}, #{director_turns}) ──")
                         print(f"    {_dcoach[:400]}")
@@ -2638,7 +2689,7 @@ def clean_results(regen=True, purge=False, dry_run=False):
     return deduped
 
 
-def main(director=None):
+def main(director=None, model_filter=None):
     os.makedirs(RESULTS_BASE, exist_ok=True)
 
     resp = requests.get("http://localhost:11434/api/tags", timeout=10)
@@ -2671,6 +2722,14 @@ def main(director=None):
         else:
             caps = get_model_capabilities(m)
             skipped_models.append((m, sorted(caps) or "embedding"))
+    # Optional --model / --models filter: restrict the run to specific models
+    # (substring match, comma-separated) so the gauntlet/director can be tested
+    # on targeted models instead of all of them.
+    if model_filter:
+        _flt = [x.strip().lower() for x in model_filter.split(",") if x.strip()]
+        _before = len(chat_models)
+        chat_models = [m for m in chat_models if any(f in m.lower() for f in _flt)]
+        print(f"\nModel filter '{model_filter}' -> {len(chat_models)}/{_before} model(s) selected: {chat_models}")
     if skipped_models:
         print(f"\nSkipping {len(skipped_models)} non-chat model(s):")
         for m, caps in skipped_models:
@@ -2789,6 +2848,17 @@ if __name__ == "__main__":
             print("ERROR: --director requires a model name (e.g. --director qwen3:8b)")
             _sys.exit(2)
     arg_set = set(args)
+    # Parse --model / --models MODEL[,MODEL...] (comma-separated substring filter).
+    _model_filter = None
+    for _mf in ("--model", "--models"):
+        if _mf in args:
+            _mi = args.index(_mf)
+            if _mi + 1 < len(args):
+                _model_filter = args[_mi + 1]
+            else:
+                print(f"ERROR: {_mf} requires a model name or comma-separated list")
+                _sys.exit(2)
+            break
     if "--clean" in arg_set:
         # Deduplicate ranking + delete losing run dirs, then regen tables.
         clean_results(regen=True, purge=True, dry_run=False)
@@ -2804,4 +2874,4 @@ if __name__ == "__main__":
     elif "--regen" in args:
         regenerate_ranking()
     else:
-        main(director=_director)
+        main(director=_director, model_filter=_model_filter)
