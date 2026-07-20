@@ -1867,12 +1867,20 @@ def run_model_benchmark(model, director=None):
             _solved = timing.get("hash_match") and timing.get("compile_ok")
             if not _solved:
                 _dtrans = _build_director_transcript(run_dir, messages, timing)
+                _d_messages = [{"role": "user", "content": DIRECTOR_SYSTEM},
+                               {"role": "user", "content": _dtrans}]
+                # Persist the DIRECTOR's FULL outbound context (role-tagged) so the
+                # complete prompt sent to the director each turn is on disk.
+                try:
+                    with open(os.path.join(run_dir, f"context_director_turn{turn}.json"), "w") as f:
+                        json.dump({"actor": "director", "turn": turn,
+                                    "messages": _d_messages}, f, indent=2)
+                except Exception:
+                    pass
                 try:
                     _d_start = time.time()
                     _dresp = call_ollama(
-                        director,
-                        [{"role": "user", "content": DIRECTOR_SYSTEM},
-                         {"role": "user", "content": _dtrans}],
+                        director, _d_messages,
                         capabilities=get_model_capabilities(director),
                     )
                     _d_dur = time.time() - _d_start
@@ -1888,18 +1896,45 @@ def run_model_benchmark(model, director=None):
                             "completion_tokens": _dtok,
                             "duration_s": round(_d_dur, 3),
                         })
-                        print(f"  ── DIRECTOR COACH (turn {turn}, #{director_turns}) ──")
+                        print(f"  ── DIRECTOR | COACH (turn {turn}, #{director_turns}) ──")
                         print(f"    {_dcoach[:400]}")
+                        # Raw director coaching text, full (not truncated).
+                        try:
+                            with open(os.path.join(run_dir, f"raw_director_turn{turn}.txt"), "w") as f:
+                                f.write(_dcoach)
+                        except Exception:
+                            pass
                         messages.append({
                             "role": "user", "content": _dcoach, "fed_to_model": True,
+                            "actor": "director",
                         })
                         conversation.append({
                             "turn": turn, "role": "director", "content": _dcoach,
+                            "actor": "director",
                         })
                 except Exception as e:
                     print(f"  DIRECTOR CALL ERROR (continuing without coaching): {e}")
 
         print(f"\n--- Turn {turn} ---")
+
+        # Persist the CODER's FULL outbound context (the exact messages sent to
+        # Ollama this turn) so the complete prompt — system intro + all prior
+        # turns + any director coaching — is durably on disk, not just summarized
+        # in stdout.
+        try:
+            with open(os.path.join(run_dir, f"context_coder_turn{turn}.json"), "w") as f:
+                json.dump({"actor": "coder", "turn": turn, "model": model,
+                            "messages": messages}, f, indent=2)
+        except Exception:
+            pass
+
+        # Flush stdout every turn so the full per-iteration context + tool
+        # calls/results are durable on disk regardless of how the run was
+        # launched (direct-import drivers don't get __main__'s line_buffering).
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
 
         try:
             _call_start = time.time()
@@ -1936,7 +1971,7 @@ def run_model_benchmark(model, director=None):
             })
 
         conversation.append({
-            "turn": turn, "role": "assistant",
+            "turn": turn, "role": "assistant", "actor": "coder",
             "content": content, "tool_calls": tool_calls
         })
 
@@ -2005,7 +2040,7 @@ def run_model_benchmark(model, director=None):
             # should at least be well-formed; log the verdict transparently so
             # the user can audit what the model actually produced each turn.
             _audit = jq_audit(content) if content else True
-            print(f"  ── TOOL REQUEST ── turn={turn} n_calls={len(tool_calls)} "
+            print(f"  ── CODER | TOOL REQUEST ── turn={turn} n_calls={len(tool_calls)} "
                   f"jq_audit={'PASS' if _audit else 'FAIL'}")
             for tc in tool_calls:
                 fn = tc.get("function", {})
@@ -2013,7 +2048,7 @@ def run_model_benchmark(model, director=None):
                 args = fn.get("arguments", {})
 
                 # ── TOOL REQUEST (sent): pretty-print the call + args ──
-                print(f"  ── TOOL REQUEST ── {name}")
+                print(f"  ── CODER | TOOL REQUEST ── {name}")
                 try:
                     print(_pretty_json(args))
                 except Exception:
@@ -2030,7 +2065,7 @@ def run_model_benchmark(model, director=None):
                     valid = ", ".join(sorted(TOOL_DISPATCH.keys()))
                     # Log the bad call safely (truncated/sanitized) so it can't
                     # kill or corrupt the log stream.
-                    print(f"  ── BAD TOOL CALL (safe-logged) ── name={_safe_log(name)} "
+                    print(f"  ── CODER | BAD TOOL CALL (safe-logged) ── name={_safe_log(name)} "
                           f"args={_safe_log(args)}")
                     result = json.dumps({
                         "ok": False,
@@ -2048,7 +2083,7 @@ def run_model_benchmark(model, director=None):
                     _rj = None
                     _malformed = True
                 if _malformed:
-                    print(f"  ── MALFORMED TOOL RESULT (safe-logged) ── {_safe_log(result)}")
+                    print(f"  ── CODER | MALFORMED TOOL RESULT (safe-logged) ── {_safe_log(result)}")
                 elif name in TOOL_DISPATCH and _rj.get("ok") is False and "error" in _rj:
                     _req = _required_args_for(name)
                     if _req:
@@ -2107,7 +2142,7 @@ def run_model_benchmark(model, director=None):
                     # Pretty-print the file the model wrote (full source).
                     _p = args.get("path", "?")
                     _c = args.get("content", "")
-                    print(f"  ── SOURCE WRITTEN ── {_p} ({len(_c)} bytes)")
+                    print(f"  ── CODER | SOURCE WRITTEN ── {_p} ({len(_c)} bytes)")
                     print(_pretty_json({"path": _p, "content": _c}))
 
                 if name == "read_file":
@@ -2138,7 +2173,7 @@ def run_model_benchmark(model, director=None):
                         print(f"  ── MALFORMED list_dir RESULT (safe-logged) ── {_safe_log(result)}")
 
                 # ── FED TO MODEL (received): pretty-print the result ──
-                print(f"  ── FED TO MODEL ── {name}")
+                print(f"  ── CODER | FED TO MODEL ── {name}")
                 # Defense-in-depth: if lint ever slips into a payload sent to the
                 # model, warn loudly (the hard guard in tool_compile_java already
                 # prevents this by raising, but this catches any other path).
@@ -2152,7 +2187,7 @@ def run_model_benchmark(model, director=None):
                 except Exception:
                     print(_safe_log(result))
                 conversation.append({
-                    "turn": turn, "role": "tool",
+                    "turn": turn, "role": "tool", "actor": "coder",
                     "name": name, "content": result,
                     "fed_to_model": fed_to_model,
                 })
@@ -2185,9 +2220,9 @@ def run_model_benchmark(model, director=None):
                 os.makedirs(os.path.dirname(full_path) or run_dir, exist_ok=True)
                 with open(full_path, "w") as f:
                     f.write(content_body)
-                print(f"  Extracted fake tool call: wrote {path} ({len(content_body)} bytes)")
+                print(f"  ── CODER | Extracted fake tool call: wrote {path} ({len(content_body)} bytes)")
                 conversation.append({
-                    "turn": turn, "role": "tool",
+                    "turn": turn, "role": "tool", "actor": "coder",
                     "name": "write_file", "content": json.dumps({"ok": True, "path": path, "size": len(content_body)})
                 })
 
@@ -2240,7 +2275,7 @@ def run_model_benchmark(model, director=None):
                 java_path = os.path.join(run_dir, "hashprime.java")
                 with open(java_path, "w") as f:
                     f.write(code)
-                print(f"  Extracted Java code ({len(code)} bytes)")
+                print(f"  ── CODER | Extracted Java code ({len(code)} bytes)")
 
                 tcv = try_compile_and_verify(run_dir)
                 timing["compile_ok"] = tcv["compile_ok"]

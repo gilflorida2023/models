@@ -21,10 +21,3 @@ Respond with a JSON tool call to use a tool, or plain text to communicate.
 
 Your program must produce the prime bytes (and therefore the matching digest) at ALL four scales. The same algorithm must be correct from N=2 through N=10000000.range could be large.
 
-HELPFUL TOOLS (use them to verify as you go):
-
-  - write_file        : save your code to hashprime.java
-  - compile_java      : compile it with javac
-  - run               : run java hashprime N ; check it equals the expected digest above
-  - submit_answer     : submit your final code when confident
-  - search_solutions  : query the prior hashprime.java solutions
