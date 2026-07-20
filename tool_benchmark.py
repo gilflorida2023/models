@@ -9,13 +9,16 @@ Handles both native tool-calling models and text-only models (extracts code).
 
 import json, os, sys, time, subprocess, hashlib, re, shutil
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 class _TimestampStream:
-    """Wrap a text stream and prefix every logical line with an RFC 3339 UTC
-    timestamp (e.g. 2026-07-20T18:02:15.123Z). Auto-flushes after each newline
-    so the benchmark log streams in real time through `tee`. Presentation-only;
-    it does not alter what is logged."""
+    """Wrap a text stream and prefix every logical line with an RFC 3339
+    timestamp in the operator's LOCAL timezone (e.g. 2026-07-20T13:29:45.123-05:00,
+    auto-adjusting for daylight savings). Falls back to UTC/Zulu (…Z) only when
+    the local zone cannot be determined. Auto-flushes after each newline so the
+    benchmark log streams in real time through `tee`. Presentation-only; it does
+    not alter what is logged."""
     def __init__(self, wrapped):
         self._w = wrapped
         self._at_line_start = True
@@ -56,11 +59,35 @@ class _TimestampStream:
         return getattr(self._w, name)
 
 
+def _resolve_local_tz():
+    """Return the system local timezone, or None if it cannot be determined
+    (so the caller falls back to UTC/Zulu). A named zone (e.g. America/Chicago)
+    is used so daylight-saving transitions are applied automatically for any
+    date/time of year."""
+    try:
+        # Linux: /etc/localtime is a symlink into the zoneinfo database.
+        link = "/etc/localtime"
+        if os.path.islink(link):
+            name = os.readlink(link).split("/zoneinfo/")[-1]
+            if name:
+                return ZoneInfo(name)
+        # Generic fallback: let the platform infer its local zone.
+        return datetime.now().astimezone().tzinfo
+    except Exception:
+        return None
+
+
+_LOCAL_TZ = _resolve_local_tz()
+
+
 def _ts():
-    """RFC 3339 UTC timestamp, millisecond precision, e.g.
-    2026-07-20T18:02:15.123Z (trailing space for readability)."""
-    dt = datetime.now(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z "
+    """RFC 3339 timestamp in the operator's local timezone, millisecond
+    precision, e.g. 2026-07-20T13:29:45.123-05:00 (DST-aware). Falls back to
+    UTC/Zulu (…Z) when the local zone is undetermined."""
+    if _LOCAL_TZ is None:
+        dt = datetime.now(timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z "
+    return datetime.now(_LOCAL_TZ).isoformat(timespec="milliseconds") + " "
 
 # Heavy/optional deps are imported lazily so the module still loads (e.g. for
 # standalone Java verification) on a machine without numpy / qdrant / chonkie.
@@ -508,28 +535,30 @@ def tool_compile_java(args, run_dir):
     print()
 
     try:
-        result = subprocess.run(
-            ["javac", "-Xlint:all", "hashprime.java"],
-            capture_output=True, text=True, timeout=30, cwd=run_dir
-        )
+        compile_ok, javac_stderr, escapes_repaired = _compile_only(run_dir)
+        javac_warnings = len([l for l in javac_stderr.split("\n") if "warning" in l.lower()])
 
-        if result.stderr.strip():
+        if javac_stderr.strip():
             print(f"  ── javac output ──")
-            for l in result.stderr.strip().split("\n"):
+            for l in javac_stderr.strip().split("\n"):
                 print(f"    {l}")
 
+        if escapes_repaired:
+            print("  ── escape repair applied (trivial '\\\\n' -> '\\n' style slip) ──")
+
         response = {
-            "ok": result.returncode == 0,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "ok": compile_ok,
+            "returncode": 0 if compile_ok else 1,
+            "stdout": "",
+            "stderr": javac_stderr,
+            "escapes_repaired": escapes_repaired,
             "checkstyle_count": 0,
             "checkstyle_output": "",
             "pmd_count": 0,
             "pmd_output": "",
         }
 
-        if result.returncode == 0:
+        if compile_ok:
             cs_count, cs_lines, cs_time = run_checkstyle(full_path, run_dir)
             pmd_count, pmd_lines, pmd_time = run_pmd(full_path, run_dir)
             response["checkstyle_count"] = cs_count
@@ -558,6 +587,7 @@ def tool_compile_java(args, run_dir):
             "returncode": response["returncode"],
             "stdout": response["stdout"],
             "stderr": response["stderr"],
+            "escapes_repaired": response["escapes_repaired"],
         }
         # HARD GUARD: lint is user-only and must never reach the model. If a
         # regression ever adds checkstyle/PMD to this payload, fail loudly.
@@ -1312,6 +1342,84 @@ def _verify_large_n(run_dir, n, exp_hash, exp_count, prefix):
     return False, False, 0.0, "", last_err
 
 
+def _is_escape_error(stderr):
+    """True if javac's stderr indicates a trivial escaping slip that broke
+    compilation — the kind a model makes when it writes '\\\\n' instead of
+    '\\n' inside a char literal. Covers the error wordings javac actually
+    emits for doubled-backslash slips (invalid character constant, illegal
+    escape character, unclosed character/string literal)."""
+    s = stderr or ""
+    return (
+        "invalid character constant" in s
+        or "illegal escape character" in s
+        or "unclosed character literal" in s
+        or "unclosed string literal" in s
+    )
+
+
+def _repair_escape_sequences(src):
+    """Fix the common doubled-backslash escape slips that cause a COMPILE error
+    (e.g. a char literal '\\\\n' -> '\\n'). Safe, targeted substitutions only;
+    the caller must recompile to confirm the fix actually helped."""
+    repairs = [
+        ("\\\\n", "\\n"),
+        ("\\\\t", "\\t"),
+        ("\\\\r", "\\r"),
+        ("\\\\b", "\\b"),
+        ("\\\\f", "\\f"),
+        ("\\\\\"", "\\\""),
+        ("\\\\'", "\\'"),
+    ]
+    out = src
+    for bad, good in repairs:
+        out = out.replace(bad, good)
+    # Generic catch-all: collapse any leftover doubled backslash (e.g. '\\\\').
+    out = out.replace("\\\\", "\\")
+    return out
+
+
+def _compile_only(run_dir):
+    """Compile hashprime.java, auto-repairing a trivial escaping slip that
+    breaks compilation. Returns (compile_ok, stderr, escapes_repaired).
+    On repair failure the original source is restored so the failure is honest.
+    """
+    java_file = os.path.join(run_dir, "hashprime.java")
+    if not os.path.exists(java_file):
+        return False, "hashprime.java not found", False
+    jr = subprocess.run(
+        ["javac", "-Xlint:all", "hashprime.java"],
+        capture_output=True, text=True, timeout=30, cwd=run_dir
+    )
+    if jr.returncode == 0:
+        return True, jr.stderr, False
+    stderr = jr.stderr
+    if not _is_escape_error(stderr):
+        return False, stderr, False
+    with open(java_file) as f:
+        src = f.read()
+    fixed = _repair_escape_sequences(src)
+    if fixed == src:
+        return False, stderr, False
+    # Preserve the model's original submission for audit.
+    try:
+        with open(java_file + ".orig", "w") as f:
+            f.write(src)
+    except Exception:
+        pass
+    with open(java_file, "w") as f:
+        f.write(fixed)
+    jr2 = subprocess.run(
+        ["javac", "hashprime.java"],
+        capture_output=True, text=True, timeout=30, cwd=run_dir
+    )
+    if jr2.returncode == 0:
+        return True, jr2.stderr, True
+    # Repair didn't help — restore the original so the failure is honest.
+    with open(java_file, "w") as f:
+        f.write(src)
+    return False, jr2.stderr, False
+
+
 def try_compile_and_verify(run_dir):
     """Compile hashprime.java, run it, check hash, run lint tools.
     Returns dict with compile_ok, hash_match, javac_warnings, checkstyle_count, pmd_count, exec_time, output."""
@@ -1323,6 +1431,7 @@ def try_compile_and_verify(run_dir):
         "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "",
         "large_n2_match": False, "large_n2_count_match": False,
         "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": "",
+        "escapes_repaired": False,
     }
     if not os.path.exists(java_file):
         return result
@@ -1337,19 +1446,19 @@ def try_compile_and_verify(run_dir):
         print(f"    ... ({len(code_lines) - 35} more lines)")
     print()
 
-    javac_result = subprocess.run(
-        ["javac", "-Xlint:all", "hashprime.java"],
-        capture_output=True, text=True, timeout=30, cwd=run_dir
-    )
-    compile_ok = javac_result.returncode == 0
-    javac_warnings = len([l for l in javac_result.stderr.split("\n") if "warning" in l.lower()])
+    compile_ok, javac_stderr, escapes_repaired = _compile_only(run_dir)
+    javac_warnings = len([l for l in javac_stderr.split("\n") if "warning" in l.lower()])
 
-    if javac_result.stderr.strip():
+    if javac_stderr.strip():
         print(f"  ── javac output ──")
-        for l in javac_result.stderr.strip().split("\n"):
+        for l in javac_stderr.strip().split("\n"):
             print(f"    {l}")
 
+    if escapes_repaired:
+        print("  ── escape repair applied (trivial '\\\\n' -> '\\n' style slip) ──")
+
     if not compile_ok:
+        # Fallback no-lint retry for non-escape compile failures.
         javac_result2 = subprocess.run(
             ["javac", "hashprime.java"],
             capture_output=True, text=True, timeout=30, cwd=run_dir
@@ -1365,6 +1474,7 @@ def try_compile_and_verify(run_dir):
 
     result["compile_ok"] = True
     result["javac_warnings"] = javac_warnings
+    result["escapes_repaired"] = escapes_repaired
 
     # Run lint tools
     cs_count, cs_lines, cs_time = run_checkstyle(java_file, run_dir)
@@ -1597,14 +1707,23 @@ def score_run(run_dir, conversation, timing, mode):
 
     jq_audit_passed = timing.get("jq_audit_passed", True)
     semantic_passed = timing.get("semantic_passed", True)
-    if mode != "tool_call" and (not jq_audit_passed or not semantic_passed):
-        score["tool_usage"] = 0
+    if mode != "tool_call":
+        # Text-mode models deliver code via plaintext extraction, not a JSON tool
+        # call, so jq-validity is irrelevant. Credit the single delivery mechanism
+        # (write_file) they can use; only an off-topic (semantic) failure is a zero.
+        if not semantic_passed:
+            score["tool_usage"] = 0
+        else:
+            expected_tools = {"write_file"}
+            used = len(tools_used & expected_tools)
+            score["tool_usage"] = int((used / len(expected_tools)) * 100)
     else:
         expected_tools = {"write_file", "read_file", "list_dir", "compile_java", "run", "submit_answer"}
         used = len(tools_used & expected_tools)
         score["tool_usage"] = int((used / len(expected_tools)) * 100)
     score["details"]["tools_used"] = sorted(tools_used) if tools_used else ["(none)"]
     score["details"]["mode"] = mode
+    score["details"]["escapes_repaired"] = timing.get("escapes_repaired", False)
     score["details"]["jq_audit_passed"] = jq_audit_passed
     score["details"]["semantic_passed"] = semantic_passed
     score["details"]["semantic_score"] = timing.get("semantic_score", 0.0)
@@ -1887,7 +2006,7 @@ def run_model_benchmark(model, director=None):
     coder_intro = CODER_SYSTEM if director else PROMPT
     messages = [{"role": "user", "content": coder_intro}]
     conversation = []
-    timing = {"total_seconds": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "capabilities": sorted(capabilities),
+    timing = {"total_seconds": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "escapes_repaired": False, "capabilities": sorted(capabilities),
               "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None,
               "large_n2_match": False, "large_n2_count_match": False, "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": ""}
     timing["director"] = director
@@ -2048,31 +2167,25 @@ def run_model_benchmark(model, director=None):
             pass  # once failed, stays failed
 
         if not tool_calls and content and not jq_passed:
-            print(f"  ⚠ jq audit FAILED — raw output is not valid JSON")
-            # Persist the failed stream for the user to inspect: a consolidated,
-            # clearly-labeled log of every turn whose raw output failed the jq
-            # JSON-validity audit (mirrors the per-turn raw_output_turnN.txt but
-            # with a header so the failure is obvious).
+            # Text-mode (non-tool-call) models are expected to emit the program as
+            # a ```java fenced block; JSON validity is irrelevant for them. Log it
+            # for audit but guide them toward the code-block format rather than
+            # demanding a JSON tool call they can't produce.
+            print(f"  ⚠ text-mode response (no JSON tool call) — expecting a ```java block")
             with open(os.path.join(run_dir, "failed_streams.log"), "a") as _fs:
-                _fs.write(f"\n=== Turn {turn} — jq audit FAILED (raw output is not valid JSON) ===\n")
+                _fs.write(f"\n=== Turn {turn} — text-mode (no JSON tool call); expecting a ```java fenced block ===\n")
                 _fs.write(_safe_log(content, limit=200000) + "\n")
-            # Record the failure in the persisted conversation transcript so it
-            # is visible in conversation.json (not just in failed_streams.log).
             conversation.append({
-                "turn": turn, "role": "jq_audit_failed", "content": content
+                "turn": turn, "role": "text_mode_no_json", "content": content
             })
-            # Send the error back to the model as a normal turn so it can
-            # self-correct — same convention as the compile/hash-failure paths.
-            # Tool-call-specific: tell it to emit write_file JSON, raw (no fences).
             messages.append({"role": "assistant", "content": content})
             messages.append({
                 "role": "user",
                 "content": (
-                    "Your previous response was not valid JSON, so the tool call "
-                    "could not be parsed. Respond with RAW JSON only (no markdown "
-                    "fences, no prose) using the write_file tool, e.g. "
-                    '{"name": "write_file", "arguments": {"path": "hashprime.java", '
-                    '"content": "public class hashprime { ... }"}}.'
+                    "Put the COMPLETE Java program (public class hashprime with a "
+                    "main method) inside a single ```java fenced code block, and "
+                    "nothing else outside it. The harness extracts and compiles whatever "
+                    "is between the fences — do not wrap it in JSON."
                 ),
                 "fed_to_model": True,
             })
@@ -2159,6 +2272,7 @@ def run_model_benchmark(model, director=None):
                     try:
                         data = json.loads(result)
                         timing["compile_ok"] = data.get("ok", False)
+                        timing["escapes_repaired"] = data.get("escapes_repaired", False)
                         stderr = data.get("stderr", "")
                         wc = len([l for l in stderr.split("\n") if "warning" in l.lower()])
                         javac_warnings = max(javac_warnings, wc)
@@ -2290,6 +2404,7 @@ def run_model_benchmark(model, director=None):
 
                 tcv = try_compile_and_verify(run_dir)
                 timing["compile_ok"] = tcv["compile_ok"]
+                timing["escapes_repaired"] = tcv.get("escapes_repaired", False)
                 timing["hash_match"] = tcv["hash_match"]
                 javac_warnings = max(javac_warnings, tcv["javac_warnings"])
                 timing["checkstyle_count"] = tcv["checkstyle_count"]
@@ -2338,9 +2453,18 @@ def run_model_benchmark(model, director=None):
                 with open(java_path, "w") as f:
                     f.write(code)
                 print(f"  ── CODER | Extracted Java code ({len(code)} bytes)")
+                # Credit the extracted write as a write_file tool action so text
+                # models that deliver code via a ```java block are not penalized
+                # on the TOOL / tool-usage metrics (mirrors the fake-JSON branch).
+                conversation.append({
+                    "turn": turn, "role": "tool", "actor": "coder",
+                    "name": "write_file",
+                    "content": json.dumps({"ok": True, "path": "hashprime.java", "size": len(code)})
+                })
 
                 tcv = try_compile_and_verify(run_dir)
                 timing["compile_ok"] = tcv["compile_ok"]
+                timing["escapes_repaired"] = tcv.get("escapes_repaired", False)
                 timing["hash_match"] = tcv["hash_match"]
                 javac_warnings = max(javac_warnings, tcv["javac_warnings"])
                 timing["checkstyle_count"] = tcv["checkstyle_count"]
@@ -2387,6 +2511,7 @@ def run_model_benchmark(model, director=None):
             print("  Re-running large-N verification (post-loop, untimed)...")
             tcv = try_compile_and_verify(run_dir)
             _copy_large_n(timing, tcv)
+            timing["escapes_repaired"] = tcv.get("escapes_repaired", False) or timing.get("escapes_repaired", False)
             # Keep the better of the two hash_match observations.
             timing["hash_match"] = timing.get("hash_match") or tcv.get("hash_match", False)
         except Exception as e:
@@ -2413,7 +2538,7 @@ def score_to_row(model, run_dir, score):
     tools_used_list = score["details"].get("tools_used", [])
     has_write_file = "write_file" in tools_used_list
     jq_passed = score["details"].get("jq_audit_passed", True)
-    tool_ok = "PASS" if (score["details"].get("mode") == "tool_call" or (has_write_file and jq_passed)) else "FAIL"
+    tool_ok = "PASS" if (score["details"].get("mode") == "tool_call" or has_write_file) else "FAIL"
     compile_ok = score["details"].get("compile_ok", False)
     hash_match = score["details"].get("hash_match", False)
     thinking_support = score["details"].get("thinking_support", False)
@@ -2484,6 +2609,7 @@ def score_to_row(model, run_dir, score):
         "director": score["details"].get("director"),
         "director_turns": score["details"].get("director_turns", 0),
         "dir_tag": (score["details"].get("director") or "none"),
+        "escape_repaired": score["details"].get("escapes_repaired", False),
     }
 
 
@@ -2688,7 +2814,7 @@ def _write_ranking(results_summary):
     if no_tool:
         md_lines.append("### No Tool Call Support\n")
         for r in no_tool:
-            md_lines.append(f"  - **{r['model']}** — mode {r['mode']} | jq {'PASS' if r['jq_passed'] else 'FAIL'} | write_file {'PASS' if r['has_write_file'] else 'FAIL'}")
+            md_lines.append(f"  - **{r['model']}** — mode {r['mode']} | jq {'PASS' if r['jq_passed'] else 'FAIL'} | write_file {'PASS' if r['has_write_file'] else 'FAIL'}" + (" | escape_repaired" if r.get("escape_repaired") else ""))
         md_lines.append("")
 
     # Thinking quality ranking (only models that emitted a thinking trace)
@@ -2909,6 +3035,7 @@ def main(director=None, model_filter=None):
                 "prompt_ts": 0.0, "thinking_drift": None, "retr_tag": "FAIL",
                 "large_n_tag": "FAIL", "large_n2_tag": "FAIL", "used_retrieval": False,
                 "jq_passed": False, "has_write_file": False, "run_dir": "",
+                "escapes_repaired": False,
             })
             continue
         if isinstance(result, dict) and result.get("skipped"):
