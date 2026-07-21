@@ -14,7 +14,7 @@ Critical formatting rule: The byte sequence must be the decimal representation o
 
 Compute the SHA-256 hash of these exact bytes (UTF-8).
 Print only the resulting hash as a lowercase hexadecimal string to stdout. No extra spaces, newlines, or text.
-The program must handle N up to at least 10,000,000 efficiently.
+The program must handle N up to at least 1,000,000,000 efficiently.
 
 Validation Cases (must all pass):java hashprime 11 → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
 java hashprime 12 → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc (same as N=11)
