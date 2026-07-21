@@ -137,9 +137,12 @@ def load_manifest_checkpoints():
                 ni = int(n)
             except ValueError:
                 continue
+            entry = {"hash": chk.get("hash", ""), "count": chk.get("count", 0)}
             if ni in out:
-                out[ni]["hash"] = chk.get("hash", out[ni]["hash"])
-                out[ni]["count"] = chk.get("count", out[ni]["count"])
+                out[ni]["hash"] = entry["hash"] or out[ni]["hash"]
+                out[ni]["count"] = entry["count"] or out[ni]["count"]
+            else:
+                out[ni] = entry
     except Exception:
         pass
     return out
@@ -152,6 +155,9 @@ LARGE_N_EXPECTED_HASH = MANIFEST_CP[LARGE_N]["hash"]
 LARGE_N_EXPECTED_COUNT = MANIFEST_CP[LARGE_N]["count"]
 LARGE_N2_EXPECTED_HASH = MANIFEST_CP[LARGE_N2]["hash"]
 LARGE_N2_EXPECTED_COUNT = MANIFEST_CP[LARGE_N2]["count"]
+LARGE_N3 = 100_000_000
+LARGE_N3_EXPECTED_HASH = MANIFEST_CP[LARGE_N3]["hash"]
+LARGE_N3_EXPECTED_COUNT = MANIFEST_CP[LARGE_N3]["count"]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(BASE_DIR, "tools")
@@ -1321,6 +1327,8 @@ def try_compile_and_verify(run_dir):
         "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "",
         "large_n2_match": False, "large_n2_count_match": False,
         "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": "",
+        "large_n3_match": False, "large_n3_count_match": False,
+        "large_n3_exec_time": 0, "large_n3_hash": "", "large_n3_error": "",
         "escapes_repaired": False,
     }
     if not os.path.exists(java_file):
@@ -1410,16 +1418,23 @@ def try_compile_and_verify(run_dir):
     result["large_n2_match"], result["large_n2_count_match"] = m2, cm2
     result["large_n2_exec_time"], result["large_n2_hash"], result["large_n2_error"] = et2, h2, err2
 
+    # Secret 1e8 manifest check — never revealed in the prompt; catches hardcoding.
+    m3, cm3, et3, h3, err3 = _verify_large_n(run_dir, LARGE_N3, LARGE_N3_EXPECTED_HASH, LARGE_N3_EXPECTED_COUNT, "1e8")
+    result["large_n3_match"], result["large_n3_count_match"] = m3, cm3
+    result["large_n3_exec_time"], result["large_n3_hash"], result["large_n3_error"] = et3, h3, err3
+
     return result
 
 
 def _copy_large_n(timing, tcv):
-    """Copy the 1e6 validation results from a try_compile_and_verify result
+    """Copy the large-N validation results from a try_compile_and_verify result
     into the run timing dict (text-mode paths otherwise drop them)."""
     for k in ("large_n_match", "large_n_count_match", "large_n_exec_time",
               "large_n_hash", "large_n_error", "large_n_count",
               "large_n2_match", "large_n2_count_match", "large_n2_exec_time",
-              "large_n2_hash", "large_n2_error"):
+              "large_n2_hash", "large_n2_error",
+              "large_n3_match", "large_n3_count_match", "large_n3_exec_time",
+              "large_n3_hash", "large_n3_error"):
         timing[k] = tcv.get(k)
 
 
@@ -1466,49 +1481,31 @@ def score_run(run_dir, conversation, timing, mode):
         "tool_usage": 0, "total": 0, "details": {}
     }
 
-    # Correctness: a correct solution compiles and produces the expected hash.
-    # The n=7..10 hash equality is a natural property of any correct program
-    # (same prime prefix) and needs no special enforcement — if it's written
-    # right, it just works.
+    # Correctness: binary PASS/FAIL.
+    # A correct solution compiles, produces the expected small-N hash,
+    # AND passes the secret 1e8 manifest check (catches hardcoding).
     hash_match = timing.get("hash_match", False)
     compile_ok = timing.get("compile_ok", False)
-    large_n_match = timing.get("large_n_match", False)
+    large_n3_match = timing.get("large_n3_match", False)
     junit_passed = timing.get("junit_passed", 0)
     junit_total = timing.get("junit_total", 0)
     junit_failed = timing.get("junit_failed", 0)
-    # Full large-N correctness = the sieve proven to SCALE (1e6/1e7 manifest
-    # match OR a full JUnit manifest sweep with zero failures). Small-N hash
-    # alone only proves the code is locally right, NOT that it scales — so it
-    # caps below 100 (catching hardcoded/naive small-N tricks).
-    scales = large_n_match or (junit_total > 0 and junit_failed == 0 and junit_passed > 0)
+    scales = large_n3_match or (junit_total > 0 and junit_failed == 0 and junit_passed > 0)
     has_java = os.path.exists(os.path.join(run_dir, "hashprime.java"))
 
     if scales:
-        # Proven to scale: full correctness.
         score["correctness"] = 100
-    elif hash_match:
-        # Correct small-N output but not proven to scale: partial.
-        score["correctness"] = 75
-    elif compile_ok:
-        score["correctness"] = 50
-    elif has_java:
-        score["correctness"] = 25
     else:
         score["correctness"] = 0
 
     score["details"]["compile_ok"] = compile_ok
     score["details"]["hash_match"] = hash_match
     score["details"]["has_java_source"] = has_java
-    score["details"]["large_n_match"] = timing.get("large_n_match", False)
-    score["details"]["large_n_count_match"] = timing.get("large_n_count_match", False)
-    score["details"]["large_n_exec_time"] = timing.get("large_n_exec_time", 0)
-    score["details"]["large_n_hash"] = timing.get("large_n_hash", "")
-    score["details"]["large_n_error"] = timing.get("large_n_error", "")
-    score["details"]["large_n2_match"] = timing.get("large_n2_match", False)
-    score["details"]["large_n2_count_match"] = timing.get("large_n2_count_match", False)
-    score["details"]["large_n2_exec_time"] = timing.get("large_n2_exec_time", 0)
-    score["details"]["large_n2_hash"] = timing.get("large_n2_hash", "")
-    score["details"]["large_n2_error"] = timing.get("large_n2_error", "")
+    score["details"]["large_n3_match"] = timing.get("large_n3_match", False)
+    score["details"]["large_n3_count_match"] = timing.get("large_n3_count_match", False)
+    score["details"]["large_n3_exec_time"] = timing.get("large_n3_exec_time", 0)
+    score["details"]["large_n3_hash"] = timing.get("large_n3_hash", "")
+    score["details"]["large_n3_error"] = timing.get("large_n3_error", "")
     score["details"]["junit_passed"] = timing.get("junit_passed", 0)
     score["details"]["junit_total"] = timing.get("junit_total", 0)
     score["details"]["junit_failed"] = timing.get("junit_failed", 0)
@@ -1667,10 +1664,7 @@ def save_results(run_dir, model, conversation, timing, score):
 ─────────────────────────────────────────────────
 Result:   {'PASS' if score['correctness'] >= 100 else 'FAIL'}
 Time:     {human_model} model = {human_total} wall  (score: {score['speed_score']}/100)
-Correct:  {'Yes - hash matches expected' if score['correctness'] >= 100 else 'No - wrong hash'}
-Compiled: {'Yes' if score['details'].get('compile_ok') else 'No'}
-Large-N (1e6):  {'Yes - hash matches A000040 manifest' if score['details'].get('large_n_match') else ('ERR - check failed: ' + str(score['details'].get('large_n_error', ''))[:60] if score['details'].get('large_n_error') else 'No - 1e6 hash mismatch')} ({score['details'].get('large_n_exec_time', 0):.2f}s)
-Large-N (1e7):  {'Yes - hash matches A000040 manifest' if score['details'].get('large_n2_match') else ('ERR - check failed: ' + str(score['details'].get('large_n2_error', ''))[:60] if score['details'].get('large_n2_error') else 'No - 1e7 hash mismatch')} ({score['details'].get('large_n2_exec_time', 0):.2f}s)
+Correct:  {'Yes - secret 1e8 test passes' if score['correctness'] >= 100 else 'No - wrong answer'}
 Quality:  {lint_str}  (score: {score['code_quality']}/100 — higher=cleaner)
 Tokens:   {prompt_tokens} sent + {completion_tokens} generated = {prompt_tokens + completion_tokens} total  (gen {gen_tok_s:.1f} tok/s, prompt {prompt_tok_s:.1f} tok/s){token_block}
 Tools:    [{tools_used}]  (score: {score['tool_usage']}/100 — higher=more tools used)
@@ -1775,8 +1769,7 @@ def _build_director_transcript(run_dir, messages, timing):
     parts.append("=== VERIFICATION STATUS ===")
     parts.append(f"compile_ok: {timing.get('compile_ok')}")
     parts.append(f"hash_match (small-N): {timing.get('hash_match')}")
-    parts.append(f"large_n_match (1e6): {timing.get('large_n_match')}")
-    parts.append(f"large_n2_match (1e7): {timing.get('large_n2_match')}")
+    parts.append(f"large_n3_match (1e8): {timing.get('large_n3_match')}")
     parts.append(f"javac_warnings: {timing.get('javac_warnings')}")
 
     # Last N tool results the coder received (role 'tool'), most recent last.
@@ -1866,7 +1859,8 @@ def run_model_benchmark(model, director=None):
     conversation = []
     timing = {"total_seconds": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "thinking_support": False, "used_retrieval": False, "escapes_repaired": False, "capabilities": sorted(capabilities),
               "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None,
-              "large_n2_match": False, "large_n2_count_match": False, "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": ""}
+              "large_n2_match": False, "large_n2_count_match": False, "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": "",
+              "large_n3_match": False, "large_n3_count_match": False, "large_n3_exec_time": 0, "large_n3_hash": "", "large_n3_error": ""}
     timing["director"] = director
     total_prompt_tokens = 0
     total_completion_tokens = 0
@@ -2351,8 +2345,7 @@ def run_model_benchmark(model, director=None):
     # corrected.
     if (timing.get("compile_ok")
             and os.path.exists(os.path.join(run_dir, "hashprime.java"))
-            and not timing.get("large_n_match")
-            and not timing.get("large_n2_match")):
+            and not timing.get("large_n3_match")):
         try:
             print("  Re-running large-N verification (post-loop, untimed)...")
             tcv = try_compile_and_verify(run_dir)
@@ -2395,12 +2388,9 @@ def score_to_row(model, run_dir, score):
     # so a 0 is not mistaken for "reasoning was poor".
     tq_err = score["details"].get("thinking_quality_error")
     tq_unavailable = (tq_err == "UNAVAILABLE")
-    large_n_match = score["details"].get("large_n_match", False)
-    large_n_err = score["details"].get("large_n_error", "")
-    large_n_tag = "PASS" if large_n_match else ("ERR" if large_n_err else "FAIL")
-    large_n2_match = score["details"].get("large_n2_match", False)
-    large_n2_err = score["details"].get("large_n2_error", "")
-    large_n2_tag = "PASS" if large_n2_match else ("ERR" if large_n2_err else "FAIL")
+    large_n3_match = score["details"].get("large_n3_match", False)
+    large_n3_err = score["details"].get("large_n3_error", "")
+    large_n3_tag = "PASS" if large_n3_match else ("ERR" if large_n3_err else "FAIL")
     total_violations = score["details"].get("javac_warnings", 0)
     turns_used = score["details"].get("turns_used", 0)
     exec_secs = score["details"].get("exec_time", 0)
@@ -2411,7 +2401,7 @@ def score_to_row(model, run_dir, score):
         "model": model,
         "model_short": model_name_short,
         "score": score["total"],
-        "correct": score["correctness"],
+        "correct": "PASS" if score["correctness"] >= 100 else "FAIL",
         "compile_ok": compile_ok,
         "hash_match": hash_match,
         "speed": score["speed_score"],
@@ -2440,8 +2430,6 @@ def score_to_row(model, run_dir, score):
         "thinking_drift": score["details"].get("thinking_drift"),
         "tq_unavailable": tq_unavailable,
         "retr_tag": retr_tag,
-        "large_n_tag": large_n_tag,
-        "large_n2_tag": large_n2_tag,
         "used_retrieval": used_retrieval,
         "jq_passed": jq_passed,
         "has_write_file": has_write_file,
@@ -2489,9 +2477,6 @@ def _write_ranking(results_summary):
         ("model",   "MODEL", 25,  "MODEL"),
         ("score",   "TOTAL", 5,   "TOTAL"),
         ("correct", "CORR",  5,   "CORR"),
-        ("c_tag",   "CPILE", 5,   "CPILE"),
-        ("h_tag",   "HASH",  5,   "HASH"),
-        ("viol",    "VIOL",  4,   "VIOL"),
         ("sem",     "SEM",   4,   "SEM"),
         ("tool",    "TOOL",  4,   "TOOL"),
         ("think",   "THINK", 5,   "THINK"),
@@ -2502,15 +2487,11 @@ def _write_ranking(results_summary):
         ("exec",    "EXEC",  9,   "EXEC"),
         ("time",    "MTIME", 10,  "MTIME"),
         ("tok_s",   "TOK/s", 7,   "TOK/s"),
-        ("large",   "1E6",   5,   "1E6"),
-        ("large2",  "1E7",   5,   "1E7"),
         ("mode",    "MODE",  8,   "MODE"),
         ("dir",     "DIR",   20,  "DIR"),
     ]
 
     def row_values(i, r):
-        c_tag = "PASS" if r["compile_ok"] else "FAIL"
-        h_tag = "PASS" if r["hash_match"] else "FAIL"
         drift = r["thinking_drift"]
         drift_s = f"{drift:+.2f}" if isinstance(drift, (int, float)) else "-"
         # When thinking-quality scoring was UNAVAILABLE, render TSCORE/DRIFT as N/A
@@ -2524,21 +2505,16 @@ def _write_ranking(results_summary):
             "model": r["model_short"],
             "score": r["score"],
             "correct": r["correct"],
-            "c_tag": c_tag,
-            "h_tag": h_tag,
-            "viol": r["violations"],
             "sem": r["sem_tag"],
             "tool": r["tool_ok"],
             "think": r["think_tag"],
             "retr": r["retr_tag"],
-            "ts": r["think_score"],
+            "ts": ts_val,
             "drift": drift_s,
             "iter": r["turns_used"],
             "exec": r["exec_str"],
             "time": r["time_str"],
             "tok_s": f"{r['gen_tok_s']:.1f}",
-            "large": r["large_n_tag"],
-            "large2": r["large_n2_tag"],
             "mode": r["mode"],
             "dir": r["dir_tag"] if isinstance(r.get("dir_tag"), str) else "none",
         }
@@ -2548,10 +2524,7 @@ def _write_ranking(results_summary):
         "rank":   "rank / position",
         "model":  "model name",
         "score":  "composite score (0-100)",
-        "correct":"correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale)",
-        "c_tag":  "compiled? (PASS/FAIL)",
-        "h_tag":  "SHA-256 hash matches expected? (PASS/FAIL)",
-        "viol":   "javac lint warnings (lower better)",
+        "correct":"program correct? (PASS = compiles + small-N hash matches + secret 1e8 test passes; FAIL = anything less)",
         "sem":    "semantic gate (PASS=on-topic, FAIL=off-topic, N/A=scoring unavailable / Qdrant down — NOT a model failure)",
         "tool":   "tool-call support? (PASS/FAIL)",
         "think":  "thinking/reasoning trace present? (PASS/FAIL)",
@@ -2560,10 +2533,8 @@ def _write_ranking(results_summary):
         "drift":  "TSCORE − prompt baseline (positive=more on-topic; N/A=scoring unavailable)",
         "iter":   "conversation turns used",
         "exec":   "compiled Java execution time",
-        "time":   "model wall-clock time (excl. lint)",
+        "time":   "model wall-clock time",
         "tok_s":  "generation throughput (tokens/sec)",
-        "large":  "1E6 sieve hash == manifest? (PASS/FAIL/ERR)",
-        "large2": "1E7 sieve hash == manifest? (PASS/FAIL/ERR)",
         "mode":   "tool_call = native API, text = JSON-in-plaintext",
         "dir":    "Director (coach) model; 'none' = baseline single-model run (no director)",
     }
@@ -2573,7 +2544,7 @@ def _write_ranking(results_summary):
     console_header = "  " + "  ".join(f"{h:<{w}}" for _, h, w, _ in COLS)
     print(console_header)
     print(f"  {'─'*len(console_header)}")
-    print(f"  (higher=better: TOTAL/CORR/TSCORE; lower=better: VIOL; PASS/FAIL=pass/fail; ITER=turns; EXEC=code run; MTIME=model wall-clock)")
+    print(f"  (higher=better: TOTAL/TSCORE; PASS/FAIL=pass/fail; ITER=turns; EXEC=code run; MTIME=model wall-clock)")
     print(f"{'─'*150}")
     for i, r in enumerate(results_summary, 1):
         v = row_values(i, r)
@@ -2608,10 +2579,7 @@ def _write_ranking(results_summary):
         "",
         "### Key",
         "- **TOTAL**: composite score (0–100)",
-        "- **CORR**: correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale via 1E6/1E7 manifest or full JUnit sweep)",
-        "- **CPILE**: code compiled? (PASS/FAIL)",
-        "- **HASH**: SHA-256 hash matches expected? (PASS/FAIL)",
-        "- **VIOL**: total javac lint warnings (lower is better)",
+        "- **CORR**: program correct? (PASS = compiles + small-N hash matches + secret 1e8 test passes; FAIL = anything less)",
         "- **SEM**: semantic gate pass? (PASS = output is on-topic for the hashprime problem)",
         "- **TOOL**: tool call support? (PASS = native API or text-mode with valid JSON + file write)",
         "- **THINK**: thinking/reasoning trace present? (PASS = Ollama returned a non-empty `thinking` field when `think:true` requested)",
@@ -2855,7 +2823,7 @@ def main(director=None, model_filter=None):
                 "thinking_support": False, "think_score": 0, "thinking_quality_chunks": 0,
                 "thinking_quality_mean_sim": 0.0, "thinking_quality_error": str(e)[:200],
                 "prompt_ts": 0.0, "thinking_drift": None, "retr_tag": "FAIL",
-                "large_n_tag": "FAIL", "large_n2_tag": "FAIL", "used_retrieval": False,
+                "used_retrieval": False,
                 "jq_passed": False, "has_write_file": False, "run_dir": "",
                 "escapes_repaired": False,
             })
