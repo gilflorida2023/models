@@ -155,9 +155,6 @@ LARGE_N2_EXPECTED_COUNT = MANIFEST_CP[LARGE_N2]["count"]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(BASE_DIR, "tools")
-CHECKSTYLE_JAR = os.path.join(TOOLS_DIR, "checkstyle.jar")
-CHECKSTYLE_CONFIG = os.path.join(TOOLS_DIR, "checkstyle_config.xml")
-PMD_BIN = os.path.join(TOOLS_DIR, "pmd", "bin", "pmd")
 JUNIT_JAR = os.path.join(BASE_DIR, "junit", "junit-platform-console-standalone.jar")
 JUNIT_SRC = os.path.join(BASE_DIR, "junit", "HashprimeVerificationTest.java")
 JUNIT_OUT = os.path.join(BASE_DIR, "junit", "out")
@@ -552,36 +549,13 @@ def tool_compile_java(args, run_dir):
             "stdout": "",
             "stderr": javac_stderr,
             "escapes_repaired": escapes_repaired,
-            "checkstyle_count": 0,
-            "checkstyle_output": "",
-            "pmd_count": 0,
-            "pmd_output": "",
         }
 
         if compile_ok:
-            cs_count, cs_lines, cs_time = run_checkstyle(full_path, run_dir)
-            pmd_count, pmd_lines, pmd_time = run_pmd(full_path, run_dir)
-            response["checkstyle_count"] = cs_count
-            response["checkstyle_output"] = "\n".join(cs_lines)
-            response["pmd_count"] = pmd_count
-            response["pmd_output"] = "\n".join(pmd_lines)
-            if cs_lines:
-                with open(os.path.join(run_dir, "checkstyle_report.txt"), "w") as f:
-                    f.write("\n".join(cs_lines) + "\n")
-            if pmd_lines:
-                with open(os.path.join(run_dir, "pmd_report.txt"), "w") as f:
-                    f.write("\n".join(pmd_lines) + "\n")
-            # LINT IS USER-ONLY: never sent to the model. The model only ever
-            # sees the javac output (ok/returncode/stdout/stderr) so it can fix
-            # its own code; checkstyle/PMD violations are for the user's report.
-            print(f"  ── LINT (user-only, NOT sent to model) ── "
-                  f"checkstyle={cs_count}, pmd={pmd_count}")
+            print(f"  ── Compilation OK ──")
         else:
-            print(f"  ── LINT skipped (compile failed) ──")
+            print(f"  ── Compilation failed ──")
 
-        # Build the result string FED TO THE MODEL: javac output only, lint
-        # content (checkstyle/PMD) stripped. lint is USER-ONLY, never sent to
-        # the model. (Full response w/ lint is kept for the user in score.json.)
         model_response = {
             "ok": response["ok"],
             "returncode": response["returncode"],
@@ -589,9 +563,6 @@ def tool_compile_java(args, run_dir):
             "stderr": response["stderr"],
             "escapes_repaired": response["escapes_repaired"],
         }
-        # HARD GUARD: lint is user-only and must never reach the model. If a
-        # regression ever adds checkstyle/PMD to this payload, fail loudly.
-        _assert_no_lint_leak(model_response)
         return json.dumps(model_response)
     except subprocess.TimeoutExpired:
         return json.dumps({"ok": False, "error": "Compilation timed out"})
@@ -882,15 +853,15 @@ TOOL_SCHEMA = [
                 "required": ["command"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "compile_java",
-            "description": "Compile hashprime.java with javac and run lint checks (checkstyle, PMD).",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "compile_java",
+                    "description": "Compile hashprime.java with javac.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
     {
         "type": "function",
         "function": {
@@ -1020,92 +991,9 @@ def is_chat_model(model):
     return True
 
 
-# === Lint tools ===
-
-CHECKSTYLE_ENABLED = os.path.exists(CHECKSTYLE_JAR)
-PMD_ENABLED = os.path.exists(PMD_BIN)
-
-# Lint (checkstyle/PMD) is informational and USER-ONLY. These markers are used
-# by _assert_no_lint_leak to guarantee lint content is never placed in a payload
-# that gets sent to the model.
-LINT_LEAK_MARKERS = ("checkstyle", "pmd")
 
 
-def _assert_no_lint_leak(payload):
-    """Hard guard: raise if a model-facing payload would leak lint content.
-
-    Lint results (checkstyle/PMD) are for the user's report only and must never
-    reach the model. If a future change accidentally adds a lint key to the
-    payload handed back to the model, fail loudly instead of silently leaking.
-    """
-    lowered = payload.lower() if isinstance(payload, str) else json.dumps(payload).lower()
-    for marker in LINT_LEAK_MARKERS:
-        if marker in lowered:
-            raise RuntimeError(
-                f"LINT LEAK GUARD: model-facing payload contains lint marker '{marker}'. "
-                f"Lint must never be sent to the model (user-only). Payload: {lowered[:200]}"
-            )
-
-
-def run_checkstyle(java_path, run_dir):
-    if not CHECKSTYLE_ENABLED:
-        return 0, [], 0
-    if not os.path.exists(java_path):
-        return 0, [], 0
-    try:
-        start = time.time()
-        result = subprocess.run(
-            ["java", "-jar", CHECKSTYLE_JAR, "-c", CHECKSTYLE_CONFIG, java_path],
-            capture_output=True, text=True, timeout=30, cwd=run_dir
-        )
-        elapsed = time.time() - start
-        # Only count actual violations ([WARN] lines). Checkstyle also prints
-        # "Starting audit..." / "Audit done." bookends (and possibly [ERROR]
-        # lines on config problems) which must not inflate the VIOL score.
-        lines = [
-            l for l in result.stdout.split("\n")
-            if l.strip().startswith("[WARN]")
-        ]
-        count = len(lines)
-        if count > 0:
-            print(f"  ── Checkstyle ({count} violations) ──")
-            for l in lines:
-                print(f"    {l}")
-        return count, lines, elapsed
-    except subprocess.TimeoutExpired:
-        return 0, [], 0
-    except Exception:
-        return 0, [], 0
-
-
-def run_pmd(java_path, run_dir):
-    if not PMD_ENABLED:
-        return 0, [], 0
-    if not os.path.exists(java_path):
-        return 0, [], 0
-    try:
-        start = time.time()
-        result = subprocess.run(
-            [PMD_BIN, "check", "-f", "text", "-R",
-             "category/java/bestpractices.xml,category/java/errorprone.xml",
-             "-d", java_path],
-            capture_output=True, text=True, timeout=60, cwd=run_dir
-        )
-        elapsed = time.time() - start
-        lines = [l for l in result.stdout.split("\n") if l.strip() and "PMD " not in l]
-        count = len(lines)
-        if count > 0:
-            print(f"  ── PMD ({count} violations) ──")
-            for l in lines:
-                print(f"    {l}")
-        return count, lines, elapsed
-    except subprocess.TimeoutExpired:
-        return 0, [], 0
-    except Exception:
-        return 0, [], 0
-
-
-def jq_audit(text):
+# === JUnit ===
     """Pipe text through jq to verify it's valid JSON.
     Strips ```json fences first, then tests jq parseability.
     Returns True if jq accepts the output as-is, False otherwise."""
@@ -1421,12 +1309,12 @@ def _compile_only(run_dir):
 
 
 def try_compile_and_verify(run_dir):
-    """Compile hashprime.java, run it, check hash, run lint tools.
-    Returns dict with compile_ok, hash_match, javac_warnings, checkstyle_count, pmd_count, exec_time, output."""
+    """Compile hashprime.java, run it, check hash.
+    Returns dict with compile_ok, hash_match, javac_warnings, exec_time, output."""
     java_file = os.path.join(run_dir, "hashprime.java")
     result = {
         "compile_ok": False, "hash_match": False, "javac_warnings": 0,
-        "checkstyle_count": 0, "pmd_count": 0, "exec_time": 0, "output": "",
+        "exec_time": 0, "output": "",
         "large_n_match": False, "large_n_count_match": False,
         "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "",
         "large_n2_match": False, "large_n2_count_match": False,
@@ -1475,18 +1363,6 @@ def try_compile_and_verify(run_dir):
     result["compile_ok"] = True
     result["javac_warnings"] = javac_warnings
     result["escapes_repaired"] = escapes_repaired
-
-    # Run lint tools
-    cs_count, cs_lines, cs_time = run_checkstyle(java_file, run_dir)
-    pmd_count, pmd_lines, pmd_time = run_pmd(java_file, run_dir)
-    result["checkstyle_count"] = cs_count
-    result["pmd_count"] = pmd_count
-    if cs_lines:
-        with open(os.path.join(run_dir, "checkstyle_report.txt"), "w") as f:
-            f.write("\n".join(cs_lines) + "\n")
-    if pmd_lines:
-        with open(os.path.join(run_dir, "pmd_report.txt"), "w") as f:
-            f.write("\n".join(pmd_lines) + "\n")
 
     # Run and verify hash
     for n in [11, 12]:
@@ -1663,10 +1539,8 @@ def score_run(run_dir, conversation, timing, mode):
     else:
         score["speed_score"] = 10
 
-    # Code quality (composite: javac warnings + checkstyle + PMD)
+    # Code quality (javac warnings only)
     javac_warnings = timing.get("javac_warnings", 0)
-    checkstyle_count = timing.get("checkstyle_count", 0)
-    pmd_count = timing.get("pmd_count", 0)
 
     def _score_warnings(n, thresholds):
         for t, s in thresholds:
@@ -1675,23 +1549,12 @@ def score_run(run_dir, conversation, timing, mode):
         return thresholds[-1][1]
 
     javac_score = _score_warnings(javac_warnings, [(0, 100), (2, 80), (5, 60), (999, 30)])
-    cs_score = _score_warnings(checkstyle_count, [(0, 100), (5, 80), (15, 60), (999, 30)])
-    pmd_score = _score_warnings(pmd_count, [(0, 100), (3, 80), (8, 60), (999, 30)])
 
     # LINT IS INFORMATIONAL ONLY — it must NOT validate or affect code quality.
-    # code_quality reflects compile cleanliness (javac warnings) alone; checkstyle/
-    # PMD counts are recorded in details and surfaced in the VIOL column for the
-    # user, but they never feed total. (See also the LINT LEAK guard in
-    # tool_compile_java: lint is also never sent to the model.)
+    # code_quality reflects compile cleanliness (javac warnings) alone.
     score["code_quality"] = int(javac_score)
     score["details"]["javac_warnings"] = javac_warnings
-    score["details"]["checkstyle_count"] = checkstyle_count
-    score["details"]["pmd_count"] = pmd_count
     score["details"]["javac_score"] = javac_score
-    score["details"]["checkstyle_score"] = cs_score
-    score["details"]["pmd_score"] = pmd_score
-    # Informational-only combined lint score (NOT used in total).
-    score["details"]["lint_score"] = int(cs_score * 0.5 + pmd_score * 0.5)
 
     # Tool usage - check both native API calls and text-based tool dispatches
     tools_used = set()
@@ -1776,18 +1639,15 @@ def save_results(run_dir, model, conversation, timing, score):
     completion_tokens = timing.get("completion_tokens", 0)
     tools_used = ", ".join(score["details"].get("tools_used", ["(none)"]))
     javac_warnings = score["details"].get("javac_warnings", 0)
-    checkstyle_count = score["details"].get("checkstyle_count", 0)
-    pmd_count = score["details"].get("pmd_count", 0)
+    lint_str = f"{javac_warnings} warnings"
+    if javac_warnings == 0:
+        lint_str = "0 violations (clean)"
     mode = score["details"].get("mode", "?")
     jq_passed = score["details"].get("jq_audit_passed", True)
     jq_str = "PASS jq" if jq_passed else "FAIL jq"
     sem_passed = score["details"].get("semantic_passed", True)
     sem_score = score["details"].get("semantic_score", 0.0)
     sem_str = f"PASS sem ({sem_score:.2f})" if sem_passed else f"FAIL sem ({sem_score:.2f})"
-
-    lint_str = f"{javac_warnings} javac + {checkstyle_count} checkstyle + {pmd_count} PMD"
-    if javac_warnings == 0 and checkstyle_count == 0 and pmd_count == 0:
-        lint_str = "0 violations (clean)"
 
     gen_tok_s = score["details"].get("gen_tok_s", 0.0)
     prompt_tok_s = score["details"].get("prompt_tok_s", 0.0)
@@ -1825,10 +1685,6 @@ Total:    {score['total']}/100
     for fname in os.listdir(run_dir):
         if fname.endswith(".java") or fname.endswith(".class"):
             shutil.copy2(os.path.join(run_dir, fname), os.path.join(artifacts_dir, fname))
-    for src_name in ["checkstyle_report.txt", "pmd_report.txt"]:
-        src = os.path.join(run_dir, src_name)
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(artifacts_dir, src_name))
 
 
 # === Main benchmark ===
@@ -2006,7 +1862,7 @@ def run_model_benchmark(model, director=None):
     coder_intro = CODER_SYSTEM if director else PROMPT
     messages = [{"role": "user", "content": coder_intro}]
     conversation = []
-    timing = {"total_seconds": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "checkstyle_count": 0, "pmd_count": 0, "thinking_support": False, "used_retrieval": False, "escapes_repaired": False, "capabilities": sorted(capabilities),
+    timing = {"total_seconds": 0, "javac_warnings": 0, "compile_ok": False, "hash_match": False, "thinking_support": False, "used_retrieval": False, "escapes_repaired": False, "capabilities": sorted(capabilities),
               "large_n_match": False, "large_n_count_match": False, "large_n_exec_time": 0, "large_n_hash": "", "large_n_error": "", "large_n_count": None,
               "large_n2_match": False, "large_n2_count_match": False, "large_n2_exec_time": 0, "large_n2_hash": "", "large_n2_error": ""}
     timing["director"] = director
@@ -2350,14 +2206,6 @@ def run_model_benchmark(model, director=None):
 
                 # ── FED TO MODEL (received): pretty-print the result ──
                 print(f"  ── CODER | FED TO MODEL ── {name}")
-                # Defense-in-depth: if lint ever slips into a payload sent to the
-                # model, warn loudly (the hard guard in tool_compile_java already
-                # prevents this by raising, but this catches any other path).
-                if name == "compile_java" and any(
-                    m in result.lower() for m in LINT_LEAK_MARKERS
-                ):
-                    print("  ⚠ LINT LEAK: checkstyle/PMD content reached FED TO MODEL — "
-                          "lint is user-only and must never be sent to the model.")
                 try:
                     print(_pretty_json(result))
                 except Exception:
@@ -2407,8 +2255,6 @@ def run_model_benchmark(model, director=None):
                 timing["escapes_repaired"] = tcv.get("escapes_repaired", False)
                 timing["hash_match"] = tcv["hash_match"]
                 javac_warnings = max(javac_warnings, tcv["javac_warnings"])
-                timing["checkstyle_count"] = tcv["checkstyle_count"]
-                timing["pmd_count"] = tcv["pmd_count"]
                 timing["exec_time"] = timing.get("exec_time", 0) + tcv["exec_time"]
                 _copy_large_n(timing, tcv)
                 did_compile_verify = True
@@ -2467,8 +2313,6 @@ def run_model_benchmark(model, director=None):
                 timing["escapes_repaired"] = tcv.get("escapes_repaired", False)
                 timing["hash_match"] = tcv["hash_match"]
                 javac_warnings = max(javac_warnings, tcv["javac_warnings"])
-                timing["checkstyle_count"] = tcv["checkstyle_count"]
-                timing["pmd_count"] = tcv["pmd_count"]
                 timing["exec_time"] = timing.get("exec_time", 0) + tcv["exec_time"]
                 _copy_large_n(timing, tcv)
                 did_compile_verify = True
@@ -2555,11 +2399,7 @@ def score_to_row(model, run_dir, score):
     large_n2_match = score["details"].get("large_n2_match", False)
     large_n2_err = score["details"].get("large_n2_error", "")
     large_n2_tag = "PASS" if large_n2_match else ("ERR" if large_n2_err else "FAIL")
-    total_violations = (
-        score["details"].get("javac_warnings", 0) +
-        score["details"].get("checkstyle_count", 0) +
-        score["details"].get("pmd_count", 0)
-    )
+    total_violations = score["details"].get("javac_warnings", 0)
     turns_used = score["details"].get("turns_used", 0)
     exec_secs = score["details"].get("exec_time", 0)
     model_time_secs = score["details"].get("model_time_seconds", 0)
@@ -2585,8 +2425,6 @@ def score_to_row(model, run_dir, score):
         "tools_used": ", ".join(tools_used_list),
         "mode": score["details"].get("mode", "?"),
         "javac_w": score["details"].get("javac_warnings", 0),
-        "cs": score["details"].get("checkstyle_count", 0),
-        "pmd": score["details"].get("pmd_count", 0),
         "sem_tag": sem_tag,
         "sem_score": round(sem_score, 2),
         "tool_ok": tool_ok,
@@ -2711,7 +2549,7 @@ def _write_ranking(results_summary):
         "correct":"correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale)",
         "c_tag":  "compiled? (PASS/FAIL)",
         "h_tag":  "SHA-256 hash matches expected? (PASS/FAIL)",
-        "viol":   "lint violations (javac+checkstyle+PMD; lower better)",
+        "viol":   "javac lint warnings (lower better)",
         "sem":    "semantic gate (PASS=on-topic, FAIL=off-topic, N/A=scoring unavailable / Qdrant down — NOT a model failure)",
         "tool":   "tool-call support? (PASS/FAIL)",
         "think":  "thinking/reasoning trace present? (PASS/FAIL)",
@@ -2771,7 +2609,7 @@ def _write_ranking(results_summary):
         "- **CORR**: correctness (0=none, 25=has Java, 50=compiles, 75=small-N hash match but not proven to scale, 100=hash match AND proven to scale via 1E6/1E7 manifest or full JUnit sweep)",
         "- **CPILE**: code compiled? (PASS/FAIL)",
         "- **HASH**: SHA-256 hash matches expected? (PASS/FAIL)",
-        "- **VIOL**: total lint violations (javac warnings + checkstyle + PMD; lower is better)",
+        "- **VIOL**: total javac lint warnings (lower is better)",
         "- **SEM**: semantic gate pass? (PASS = output is on-topic for the hashprime problem)",
         "- **TOOL**: tool call support? (PASS = native API or text-mode with valid JSON + file write)",
         "- **THINK**: thinking/reasoning trace present? (PASS = Ollama returned a non-empty `thinking` field when `think:true` requested)",
@@ -2780,7 +2618,7 @@ def _write_ranking(results_summary):
         "- **DRIFT**: TSCORE − PROMPT_TS (prompt baseline alignment). Positive = model reasoning is more on-topic than the prompt itself.",
         "- **ITER**: number of conversation turns the model took",
         "- **EXEC**: time for compiled Java code to execute (seconds)",
-        "- **MTIME**: total model wall-clock time excluding lint (seconds or minutes)",
+        "- **MTIME**: total model wall-clock time (seconds or minutes)",
         "- **TOK/s**: generation throughput — completion tokens per second of model wall-clock time (higher = faster generation)",
         "- **1E6**: does the sieve scale? The SHA-256 hash the program prints to stdout for N=1,000,000 matches the authoritative OEIS A000040 manifest (ascii_integer_lf). PASS = matches, FAIL = hash mismatch (wrong sieve), ERR = the 1e6 check itself errored/timed out (indeterminate — not a model fail). At 1e6 the algorithm dominates runtime, so this neutralizes any 'don't write a file' micro-optimization advantage.",
         "- **1E7**: does the faster-than-naive sieve scale to N=10,000,000? Same manifest hash/check (664579 primes). PASS = matches, FAIL = hash mismatch, ERR = check errored/timed out. Confirms the optimized algorithm (segmented / bit-packed / odds-only) produces identical output at scale and runs faster than the naive boolean[] sieve.",
@@ -2994,24 +2832,6 @@ def main(director=None, model_filter=None):
         except Exception:
             pass
 
-    # Probe lint-tool availability up front so VIOL=0 is not mistaken for a
-    # fully linted clean compile when checkstyle/PMD are simply not installed.
-    if CHECKSTYLE_ENABLED or PMD_ENABLED:
-        parts = []
-        if CHECKSTYLE_ENABLED:
-            parts.append("checkstyle")
-        if PMD_ENABLED:
-            parts.append("PMD")
-        print(f"Lint: {', '.join(parts)} enabled (plus javac warnings).")
-    else:
-        print("=" * 70)
-        print("⚠  STATIC LINT DISABLED")
-        print("   Neither checkstyle.jar nor pmd/bin/pmd found under tools/.")
-        print("   VIOL reflects JAVAC WARNINGS ONLY (not checkstyle/PMD).")
-        print("   To enable: drop checkstyle.jar + checkstyle_config.xml and the")
-        print("   pmd/ distribution into tools/.")
-        print("=" * 70)
-
     results_summary = []
 
     for model in chat_models:
@@ -3028,7 +2848,7 @@ def main(director=None, model_filter=None):
                 "speed": 0, "quality": 0, "tools": 0, "violations": 0,
                 "turns_used": 0, "exec_time_secs": 0, "exec_str": "-",
                 "model_time_secs": 0, "time_str": "-", "gen_tok_s": 0.0,
-                "tools_used": "", "mode": "?", "javac_w": 0, "cs": 0, "pmd": 0,
+                "tools_used": "", "mode": "?", "javac_w": 0,
                 "sem_tag": "FAIL", "sem_score": 0.0, "tool_ok": "FAIL", "think_tag": "FAIL",
                 "thinking_support": False, "think_score": 0, "thinking_quality_chunks": 0,
                 "thinking_quality_mean_sim": 0.0, "thinking_quality_error": str(e)[:200],
