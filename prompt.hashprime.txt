@@ -1,23 +1,34 @@
-Create the fastest possible single-file Java program named hashprime.java that takes one integer N from the command line. Generate all prime numbers from 2 to N using a Sieve of Eratosthenes, hash them and print the hash. a fast hash can be calculated from prime bytes. consider an infinite list of primes. prime bytes : prime digits \n prime digits \n ... until range ends. a prime is followed by a single newline byte ('\n'). Compute the SHA-256 digest over the prime bytes and print to stdout, ONLY the hash (as a lowercase hex string) to stdout. The digest over the prime bytes for N=11 is exactly 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc, and N=12 is identical (12 is not prime), so both must produce that same hash.
+
+Task:
+Create a single-file Java program named hashprime.java that is as fast as possible.Requirements:The program must be named public class hashprime (lowercase class name, as specified).
+It takes a single integer N from the command line (args[0]).
+Generate all prime numbers from 2 to N (inclusive) using the Sieve of Eratosthenes.
+Construct the prime bytes as follows:Each prime as decimal digits (no leading zeros).
+After every prime, including the last one, append a single newline byte ('\n').
+Example for N=11: 2\n3\n5\n7\n11\n
+
+Critical formatting rule: The byte sequence must be the decimal representation of each prime followed by a literal newline character (\n byte, ASCII 10), including after the final prime. For N=11 the exact byte string is "2\n3\n5\n7\n11\n".
 
 
-VALIDATION CONTRACT (the SHA-256 is computed over the  prime bytes; stdout shows ONLY the hash):
-  Command:              java hashprime 11
-  Prime bytes :      2\n3\n5\n7\n11\n
-  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
 
-  Command:              java hashprime 12
-  Prime bytes :      2\n3\n5\n7\n11\n   (12 is not prime, so identical to N=11)
-  Expected SHA-256 (stdout):     563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
 
-  Command:              java hashprime 1000000
-  Expected SHA-256 (stdout):     4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
+Compute the SHA-256 hash of these exact bytes (UTF-8).
+Print only the resulting hash as a lowercase hexadecimal string to stdout. No extra spaces, newlines, or text.
+The program must handle N up to at least 10,000,000 efficiently.
 
-  Command:              java hashprime 10000000
-  Expected SHA-256 (stdout):     36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
+Validation Cases (must all pass):java hashprime 11 → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
+java hashprime 12 → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc (same as N=11)
+java hashprime 1000000 → 4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
+java hashprime 10000000 → 36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
 
-Use public class hashprime (lowercase) to match the name hashfile.java.
-Respond with a JSON tool call to use a tool, or plain text to communicate.
+Additional Rules:Use only standard Java libraries (no external dependencies).
+Handle N < 2 gracefully (output the correct hash for an empty list of primes, i.e. just a single \n or empty bytes — test what produces correct behavior if needed).
+Prioritize speed for large N (10^7). Use an optimized sieve.
+Do not add any extra output or debugging text.
 
-Your program must produce the prime bytes (and therefore the matching digest) at ALL four scales. The same algorithm must be correct from N=2 through N=10000000.range could be large.
+Generate only the complete, ready-to-compile Java code. Do not include explanations outside the code file.
+
+
+Think step-by-step before writing the code
+
 
