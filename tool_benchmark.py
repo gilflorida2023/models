@@ -994,6 +994,8 @@ def is_chat_model(model):
 
 
 # === JUnit ===
+
+def jq_audit(text):
     """Pipe text through jq to verify it's valid JSON.
     Strips ```json fences first, then tests jq parseability.
     Returns True if jq accepts the output as-is, False otherwise."""
