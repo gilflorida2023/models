@@ -1,34 +1,47 @@
+# PRD: hashprime - Prime Hash Generator
 
-Task:
-Create a single-file Java program named hashprime.java that is as fast as possible.Requirements:The program must be named public class hashprime (lowercase class name, as specified).
-It takes a single integer N from the command line (args[0]).
-Generate all prime numbers from 2 to N (inclusive) using the Sieve of Eratosthenes.
-Construct the prime bytes as follows:Each prime as decimal digits (no leading zeros).
-After every prime, including the last one, append a single newline byte ('\n').
-Example for N=11: 2\n3\n5\n7\n11\n
+## 1. Overview
+**Project Name**: hashprime  
+**File**: `hashprime.java` (single file only)  
 
-Critical formatting rule: The byte sequence must be the decimal representation of each prime followed by a literal newline character (\n byte, ASCII 10), including after the final prime. For N=11 the exact byte string is "2\n3\n5\n7\n11\n".
+**OUTPUT RULE**:  
+Use the available tool(s) to produce your Java code. Keep the code free of explanatory text or markdown so it compiles cleanly.
 
+## 2. Critical Requirements – Byte Sequence & Hashing
 
+The program must construct exactly this byte sequence:
 
+- For each prime p from 2 to N (inclusive):
+  - Convert p to its decimal ASCII digits (no leading zeros).
+  - Immediately append a newline byte (\n = ASCII 10).
+- A newline must be appended after the last prime.
+- Example for N=11: 2\n3\n5\n7\n11\n
+- For N < 2: empty byte sequence (zero bytes).
 
-Compute the SHA-256 hash of these exact bytes (UTF-8).
-Print only the resulting hash as a lowercase hexadecimal string to stdout. No extra spaces, newlines, or text.
-The program must handle N up to at least 1,000,000,000 efficiently.
+Compute the SHA-256 hash of this exact byte sequence and print only the 64-character lowercase hexadecimal string to stdout.
 
-Validation Cases (must all pass):java hashprime 11 → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
-java hashprime 12 → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc (same as N=11)
-java hashprime 1000000 → 4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
-java hashprime 10000000 → 36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
+## 3. Prime Generation Requirement
 
-Additional Rules:Use only standard Java libraries (no external dependencies).
-Handle N < 2 gracefully (output the correct hash for an empty list of primes, i.e. just a single \n or empty bytes — test what produces correct behavior if needed).
-Prioritize speed for large N (10^7). Use an optimized sieve.
-Do not add any extra output or debugging text.
+You must use a correct and efficient Sieve of Eratosthenes (or optimized variant).
 
-Generate only the complete, ready-to-compile Java code. Do not include explanations outside the code file.
+Correct basic sieve logic:
+Initialize a BitSet marking numbers from 2 to n as prime.
+For each i from 2 to sqrt(n), if i is prime, mark all multiples of i (starting from i*i) as not prime.
 
+Strongly recommended for N=100000000: Use BitSet or bit packing, odd-only optimization, and segmented approach.
 
-Think step-by-step before writing the code
+## 4. Functional Requirements
+- Public class must be named hashprime (lowercase)
+- Read single integer N from command line args[0]
+- Use only standard Java libraries
+- Must handle N up to 100000000 efficiently
 
+## 5. Validation Cases
+- N=11         → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
+- N=1000000    → 4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
+- N=10000000   → 36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
 
+## 6. Success Criteria
+- Exact hash matches on all validation cases
+- Efficient execution at N=100000000
+- Perfect byte sequence including final newline
