@@ -53,6 +53,42 @@ fi
 source venv/bin/activate
 pip install -r requirements.txt
 
+# === Java Code Parser Validation (quick check before benchmark) ===
+echo "=== Running Java Code Parser Validation ==="
+python -c "
+import sys
+sys.path.insert(0, '.')
+from tool_benchmark import _looks_like_java_code, extract_java_code
+
+# Test cases that MUST pass
+tests = [
+    ('JSON tool call', '{\"name\": \"search_solutions\", \"arguments\": {}}', False),
+    ('Valid Java', '''import java.security.MessageDigest;
+public class hashprime {
+    public static void main(String[] args) {
+        System.out.println(\"Hello\");
+    }
+}''', True),
+]
+
+print('Running parser validation tests...')
+all_pass = True
+for name, content, expected in tests:
+    result = _looks_like_java_code(content)
+    status = 'PASS' if (result == expected) else 'FAIL'
+    if result != expected:
+        all_pass = False
+    print(f'  {status}: {name}')
+
+if not all_pass:
+    print('ERROR: Parser validation failed! Benchmark may have extraction issues.')
+    sys.exit(1)
+print('Parser validation: ALL TESTS PASSED')
+" || {
+    echo "Parser validation failed - aborting benchmark"
+    exit 1
+}
+
 # Run the benchmark (no need for a separate --clean since we wiped results above).
 python tool_benchmark.py  2>&1 | tee tool_benchmark.log
 

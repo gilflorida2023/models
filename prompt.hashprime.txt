@@ -1,47 +1,76 @@
-# PRD: hashprime - Prime Hash Generator
+
+# PRD: hashprime — Prime Hash Generator
 
 ## 1. Overview
-**Project Name**: hashprime  
-**File**: `hashprime.java` (single file only)  
 
-**OUTPUT RULE**:  
-Use the available tool(s) to produce your Java code. Keep the code free of explanatory text or markdown so it compiles cleanly.
+- **Project Name**: `hashprime`
+- **File Target**: `hashprime.java` (Single-file source execution / standalone CLI)
+- **Target Environment**: Java 17+ (Standard Library only)
+- **Status**: Specification Final
+- **Core Objective**: Compute the SHA-256 hash of a deterministic ASCII byte stream representing all prime numbers up to N, emitting **only** the hexadecimal digest to stdout.
 
-## 2. Critical Requirements – Byte Sequence & Hashing
+---
 
-The program must construct exactly this byte sequence:
+## 2. Technical Architecture & Constraints
 
-- For each prime p from 2 to N (inclusive):
-  - Convert p to its decimal ASCII digits (no leading zeros).
-  - Immediately append a newline byte (\n = ASCII 10).
-- A newline must be appended after the last prime.
-- Example for N=11: 2\n3\n5\n7\n11\n
-- For N < 2: empty byte sequence (zero bytes).
+### 2.1 File & Execution Constraints
+- **Single File Requirement**: Everything must reside within a single source file (`hashprime.java`).
+- **Zero External Dependencies**: Must only use standard Java libraries (`java.security.MessageDigest`, etc.).
+- **CLI Entrypoint**: Executable via `java hashprime <N>`.
 
-Compute the SHA-256 hash of this exact byte sequence and print only the 64-character lowercase hexadecimal string to stdout.
+### 2.2 Memory & Performance Guidelines
+- **Target Scale**: Must process $N = 100,000,000$ smoothly within standard JVM memory limitsD:w
+ (e.g., `-Xmx512m` or default).
+- **Streaming Hash Aggregation**: 
+  - Do **NOT** construct a gigantic string or byte array in memory for all primes up to $N$.
+  - Primes must be formatted and written incrementally (buffered) directly into a `java.security.MessageDigest` instance.
+- **Prime Generation**: Must use a memory-efficient algorithm.
 
-## 3. Prime Generation Requirement
+---
 
-You must use a correct and efficient Sieve of Eratosthenes (or optimized variant).
+## 3. Byte Sequence Specification
 
-Correct basic sieve logic:
-Initialize a BitSet marking numbers from 2 to n as prime.
-For each i from 2 to sqrt(n), if i is prime, mark all multiples of i (starting from i*i) as not prime.
+The byte stream fed into the SHA-256 algorithm must conform **exactly** to the following protocol:
 
-Strongly recommended for N=100000000: Use BitSet or bit packing, odd-only optimization, and segmented approach.
+1. **Encoding**:
+   - Convert prime into its base-10 ASCII representation (UTF-8 bytes for characters `'0'` through `'9'`). No leading zeros or spaces.
+   - Append a single ASCII newline character (`\n`, `0x0A`) immediately after each prime's number.
+2. **Trailing Newline**: A newline (`\n`) **must** follow the final prime in the sequence.
+3. **Edge Cases ($N < 2$)**: If $N < 2$, the input byte stream length must be **0 bytes** (SHA-256 computed over an empty stream).
 
-## 4. Functional Requirements
-- Public class must be named hashprime (lowercase)
-- Read single integer N from command line args[0]
-- Use only standard Java libraries
-- Must handle N up to 100000000 efficiently
+### Example Formatting
+For: java hashprime 11
+- **Prime Sequence**: `2`, `3`, `5`, `7`, `11`
+- **Raw Byte Representation (Hex)**: `32 0A 33 0A 35 0A 37 0A 31 31 0A`
+- **String Equivalent**: `"2\n3\n5\n7\n11\n"`
 
-## 5. Validation Cases
-- N=11         → 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
-- N=1000000    → 4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
-- N=10000000   → 36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
+---
 
-## 6. Success Criteria
-- Exact hash matches on all validation cases
-- Efficient execution at N=100000000
-- Perfect byte sequence including final newline
+## 4. Input & Output Protocol
+
+### Command Line Input (`args[0]`)
+- Accepts a single integer argument representing $N$.
+- **Error Handling**:
+  - If `args` is empty, or `args[0]` cannot be parsed as an integer, output nothing (or exit silently with a non-zero exit code) without crashing with an unhandled exception stack trace.
+
+### Output Protocol
+- Print **only** the 64-character, hexadecimal SHA-256 digest to standard output (`System.out`).
+- **Zero Overhead**: Do NOT output execution time, memory logs, prompts, or extra trailing newlines.
+
+---
+
+## 5. Validation Test Matrix
+
+ java hashprime -5        -> e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+ java hashprime 0         -> e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+ java hashprime 1         -> e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+ java hashprime 11        -> 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
+ java hashprime 12        -> 563d8e0603dcc07d784135d99fd81ff6bf98495e898ec1f52e2e7605320cf6dc
+ java hashprime 1000000   -> 4883963dd4510a29d6df2ffe4dd11e4e1a910e815c7810b200c77b3357f22a28
+ java hashprime `10000000 -> 36d6197802bc3b635b43b31cd6a2583f7cf8f5badff7992f3693c5102beefd14
+
+## 6. Definition of Done
+
+1. Compiles cleanly with standard `javac hashprime.java` without warnings.
+2. Passes all validation cases with exact hash string matches.
+3. Successfully computes $N = 100,000,000$ in under 5 seconds on modern hardware without throwing `OutOfMemoryError`.

@@ -281,13 +281,72 @@ CODER_SYSTEM = _load_prompt_file("prompt.coder.txt") + "\n" + TOOL_DESCRIPTIONS 
 DIRECTOR_SYSTEM = _load_prompt_file("prompt.director.txt") + "\n" + TOOL_DESCRIPTIONS + "\n" + TASK_BODY
 
 
-# === Code extraction ===
+def _looks_like_java_code(text):
+    """Quick heuristic to determine if text looks like Java code."""
+    if not text or not isinstance(text, str):
+        return False
+
+    text = text.strip()
+    if not text:
+        return False
+
+    text_lower = text.lower()
+
+# REJECT: Complete JSON tool calls (whole structures)
+    # These are complete JSON objects that look like API calls
+    reject_patterns = [
+        r'\{\s*"name"\s*:\s*"write_file"\s*[},]',
+        r'\{\s*"name"\s*:\s*"read_file"\s*[},]',
+        r'\{\s*"name"\s*:\s*"search_solutions"\s*[},]',
+        r'\{\s*"name"\s*:\s*"compile_java"\s*[},]',
+        r'\{\s*"name"\s*:\s*"submit_answer"\s*[},]',
+        r'\{\s*"name"\s*:\s*"run_command"\s*[},]',
+        r'\{\s*"name"\s*:\s*"execute"\s*[},]',
+        r'\{\s*"name"\s*:\s*"get_output"\s*[},]',
+        r'\{\s*"name"\s*:\s*"create_file"\s*[},]',
+        r'\{\s*"name"\s*:\s*"def create_result"\s*[},]',
+    ]
+
+    import re
+    for pattern in reject_patterns:
+        if re.search(pattern, text_lower):
+            return False
+
+    # Check for Java-specific patterns
+    java_patterns = [
+        'public class hashprime',
+        'import java.security',
+        'import java.util',
+        'import java.lang',
+        'public static void main',
+        'class hashprime',
+        'MessageDigest',
+        'BitSet',
+        'System.out.println',
+        'String[] args',
+        'if (args.length',
+        'implements',
+        'extends',
+        'enum',
+    ]
+
+    # Must have at least one Java pattern
+    if not any(pattern in text_lower for pattern in java_patterns):
+        return False
+
+    # Additional length check to avoid tiny fragments
+    if len(text.strip()) < 20:
+        return False
+
+    return True
+
 
 def extract_java_code(text):
     """Extract Java source code from LLM response text."""
     if not text:
         return None
 
+    # First try the existing pattern matching
     patterns = [
         r'```java\s*\n(.*?)```',
         r'```\s*\n(.*?)```',
@@ -298,13 +357,16 @@ def extract_java_code(text):
         if p.startswith('public'):
             idx = text.find('public ')
             if idx >= 0:
-                return text[idx:].rstrip() + '\n'
+                candidate = text[idx:].rstrip() + '\n'
+                if _looks_like_java_code(candidate):
+                    return candidate
         else:
             m = re.search(p, text, re.DOTALL)
             if m:
                 code = m.group(1).strip()
                 if 'public class' in code or 'class hashprime' in code or 'import' in code:
-                    return code + '\n'
+                    if _looks_like_java_code(code):
+                        return code + '\n'
 
     lines = text.split('\n')
     code_lines = []
@@ -317,7 +379,21 @@ def extract_java_code(text):
             code_lines.append(line)
 
     if code_lines:
-        return '\n'.join(code_lines) + '\n'
+        candidate = '\n'.join(code_lines) + '\n'
+        if _looks_like_java_code(candidate):
+            return candidate
+
+    # If no valid Java code found via patterns, try direct heuristic detection
+    # This helps cases where the model outputs Java code directly without delimiters
+    if _looks_like_java_code(text):
+        # Ensure it's not just a small JSON or tool call
+        if len(text.strip().split('\n')) > 10 and (
+            'public class hashprime' in text or
+            'import java.security' in text or
+            'MessageDigest' in text or
+            'class hashprime' in text
+        ):
+            return text
 
     return None
 
@@ -482,6 +558,24 @@ def extract_fake_tool_call(text):
 def tool_write_file(args, run_dir):
     path = args["path"]
     content = args["content"]
+    
+    # If model uses an absolute path (e.g., /tmp/HashPrime.java), extract just the filename
+    # and write it to the sandbox. This handles model mistakes gracefully and prevents
+    # contamination while allowing models to specify the correct filename without knowing
+    # the exact sandbox location.
+    if os.path.isabs(path):
+        # Extract filename from absolute path
+        safe_name = os.path.basename(path)
+        # Validate it's a simple filename (no path components)
+        if safe_name and safe_name == os.path.basename(safe_name) and not os.path.isabs(safe_name):
+            path = safe_name
+        else:
+            # Fallback to canonical name
+            path = "hashprime.java"
+    
+    ok, err = _sandbox_path(path, run_dir)
+    if not ok:
+        return json.dumps({"ok": False, "error": err})
     full_path = os.path.join(run_dir, path)
     os.makedirs(os.path.dirname(full_path) or run_dir, exist_ok=True)
     with open(full_path, "w") as f:
@@ -489,8 +583,21 @@ def tool_write_file(args, run_dir):
     return json.dumps({"ok": True, "path": path, "size": len(content)})
 
 
+def _sandbox_path(path, run_dir):
+    """Reject absolute paths and path traversal outside run_dir."""
+    if os.path.isabs(path):
+        return False, "absolute path rejected — use a relative path within the working directory"
+    resolved = os.path.normpath(os.path.join(run_dir, path))
+    if not resolved.startswith(os.path.normpath(run_dir) + os.sep) and resolved != os.path.normpath(run_dir):
+        return False, "path escapes the working directory — use a relative path"
+    return True, ""
+
+
 def tool_read_file(args, run_dir):
     path = args["path"]
+    ok, err = _sandbox_path(path, run_dir)
+    if not ok:
+        return json.dumps({"ok": False, "error": err})
     full_path = os.path.join(run_dir, path)
     if not os.path.exists(full_path):
         return json.dumps({"ok": False, "error": "file not found"})
@@ -518,8 +625,42 @@ def tool_list_dir(args, run_dir):
         return json.dumps({"ok": False, "error": str(e)})
 
 
+def _shell_sandbox(cmd):
+    """Verify the command is safe — no absolute paths, no traversal, no chaining."""
+    DANGEROUS_WORDS = {
+        "rm", "mv", "cp", "sudo", "dd", "mkfs", "mount", "chmod", "chown",
+        "kill", "pkill", "apt", "apt-get", "yum", "dnf", "pip", "pip3",
+        "curl", "wget", "ssh", "scp", "nc", "ncat", "netcat",
+        "python", "python3", "perl", "ruby", "php", "node",
+        "base64", "xxd", "od", "dd", "mkfifo", "mknod",
+        "mkdir", "rmdir", "touch", "ln",
+    }
+    DANGEROUS_CHARS = set(";|&$`<>!(){}~")
+    # Reject absolute paths, path traversal, home-dir refs
+    stripped = cmd.lstrip()
+    if stripped.startswith("/"):
+        return False, "absolute path rejected"
+    for token in cmd.split():
+        if ".." in token:
+            return False, "path traversal rejected"
+        if token == "~":
+            return False, "home-directory reference rejected"
+    # Check for shell metacharacters that enable chaining
+    for ch in DANGEROUS_CHARS:
+        if ch in cmd:
+            return False, f"shell metacharacter {ch!r} rejected — use dedicated tools (compile_java, run, etc.)"
+    # Check command name against blacklist
+    first_word = stripped.split()[0] if stripped.split() else ""
+    if first_word.lower() in DANGEROUS_WORDS:
+        return False, f"command {first_word!r} not allowed — use dedicated tools"
+    return True, ""
+
+
 def tool_run_command(args, run_dir):
     cmd = args["command"]
+    ok, err = _shell_sandbox(cmd)
+    if not ok:
+        return json.dumps({"ok": False, "error": f"run_command rejected: {err}"})
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60, cwd=run_dir)
         return json.dumps({
@@ -1266,9 +1407,11 @@ def _is_escape_error(stderr):
 
 
 def _repair_escape_sequences(src):
-    """Fix the common doubled-backslash escape slips that cause a COMPILE error
-    (e.g. a char literal '\\\\n' -> '\\n'). Safe, targeted substitutions only;
-    the caller must recompile to confirm the fix actually helped."""
+    """Fix common escape slips that cause a COMPILE error:
+      - Doubled backslash (\\\\n -> \\n) from over-escaped JSON.
+      - Bare backslash before characters that are NOT valid Java string escapes
+        (\\d -> \\\\d, \\s -> \\\\s, etc.) from under-escaped regex patterns.
+    The caller must recompile to confirm the fix actually helped."""
     repairs = [
         ("\\\\n", "\\n"),
         ("\\\\t", "\\t"),
@@ -1281,8 +1424,10 @@ def _repair_escape_sequences(src):
     out = src
     for bad, good in repairs:
         out = out.replace(bad, good)
-    # Generic catch-all: collapse any leftover doubled backslash (e.g. '\\\\').
-    out = out.replace("\\\\", "\\")
+    # Fix bare backslash before characters that are NOT valid Java string escapes.
+    # Valid Java escapes: \\b \\t \\n \\f \\r \\" \\' \\\\ \\0-\\377 \\uXXXX
+    # Everything else (e.g. \\d, \\s, \\w) must be doubled to \\\\d etc.
+    out = re.sub(r'\\([^btnfr"\'\\0-7u])', r'\\\\\1', out)
     return out
 
 
